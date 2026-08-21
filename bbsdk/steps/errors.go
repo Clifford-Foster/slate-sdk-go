@@ -17,6 +17,9 @@ var ErrBindingUnsupported = errors.New("bbsdk/steps: the resolved binding is not
 // ErrSeamSchemaInvalid reports a declared seam schema that will not compile (rule T12).
 var ErrSeamSchemaInvalid = errors.New("bbsdk/steps: the declared seam schema will not compile")
 
+// ErrComponentUnknown reports a Call on a slot the entry's wiring does not resolve — COMPONENT_UNKNOWN (rules T2, T7).
+var ErrComponentUnknown = errors.New("bbsdk/steps: the entry's wiring does not resolve this slot")
+
 // StepError is the one runtime failure value: the rule-3 taxonomy plus the original error (rule T4).
 type StepError struct {
 	// Message names the step and what went wrong; it is human-readable and not a compatibility surface.

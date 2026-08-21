@@ -24,24 +24,40 @@ type Runner struct {
 
 // NewRunner builds a runner over the data plane; the three keys come from the chain document.
 func NewRunner(b *Bound, board Board) *Runner {
-	return &Runner{bound: b, board: board, backoff: retryBackoff}
+	return newRunner(b, board, retryBackoff)
 }
 
-// Start runs Setup on every memory-bound step in chain order, returning the first failure
-// unwrapped — a setup failure is a startup failure, and rule 3's normalization is Run-scoped (rule T6).
-func (r *Runner) Start(ctx context.Context) error {
-	for _, stage := range r.bound.stages {
-		for _, entry := range stage {
-			setuper, hasSetup := entry.step.(Setuper)
-			if hasSetup {
-				if err := setuper.Setup(ctx, maps.Clone(entry.config)); err != nil {
-					return err
-				}
-			}
-			r.started = append(r.started, entry)
+// newRunner builds a runner whose retry backoff is the supplied one, on the stage path and inside the
+// component-call dispatcher alike — rule 8b puts the wired retries there, so the two must agree.
+func newRunner(b *Bound, board Board, backoff time.Duration) *Runner {
+	runner := &Runner{bound: b, board: board, backoff: backoff}
+	discardWalk(b.entries(func(entry *boundStep) error {
+		if entry.calls != nil {
+			entry.calls.backoff = backoff
 		}
-	}
-	return nil
+		return nil
+	}))
+	return runner
+}
+
+// discardWalk drops the error of a walk whose visitor cannot fail.
+func discardWalk(error) {}
+
+// Start runs Setup on every memory-bound step in chain order — stage by stage, declaration order
+// inside a stage, and a wired component immediately after its calling entry's in sorted slot order —
+// returning the first failure unwrapped, since a setup failure is a startup failure and rule 3's
+// normalization is Run-scoped (rule T6).
+func (r *Runner) Start(ctx context.Context) error {
+	return r.bound.entries(func(entry *boundStep) error {
+		setuper, hasSetup := entry.step.(Setuper)
+		if hasSetup {
+			if err := setuper.Setup(ctx, maps.Clone(entry.config)); err != nil {
+				return err
+			}
+		}
+		r.started = append(r.started, entry)
+		return nil
+	})
 }
 
 // Stop runs Teardown in reverse chain order, best effort: no failure stops the sweep and all of them
@@ -65,6 +81,11 @@ func (r *Runner) Stop(ctx context.Context) error {
 // Run executes one traversal: read input_key, run the stages in order, write output_key once on
 // success and never on failure, and keep the status key current (rules 8, 8a).
 func (r *Runner) Run(ctx context.Context, activationID string) error {
+	// Rule 8b's ceiling and aggregate are per activation, so every dispatcher is armed here and closed
+	// on the way out — an entry the traversal never reached included, whose calls context would
+	// otherwise outlive it.
+	r.armCalls(ctx)
+	defer r.closeCalls()
 	entry, err := r.board.Get(ctx, r.bound.chain.InputKey)
 	if err != nil {
 		return fmt.Errorf("bbsdk/steps: reading the chain input key %q: %w", r.bound.chain.InputKey, err)
@@ -83,6 +104,62 @@ func (r *Runner) Run(ctx context.Context, activationID string) error {
 		}
 	}
 	return nil
+}
+
+// RunEntry runs one bound entry once, with its dispatcher armed for the call (rule T13).
+//
+// This is the hosting a component-declaring step gets over RPC: there is no traversal, so no
+// input_key is read, no output_key or status key is written and the Board is not touched at all —
+// the input arrives from the caller and the output returns to it. The entry's own retries are not
+// applied, a rule-8.4 retry being a fresh `running` status write this hosting has no key for; a wired
+// component's retries are the dispatcher's and are untouched. At most one call per entry may be in
+// flight, exactly as Run assumes at most one traversal; no guard is added here.
+func (r *Runner) RunEntry(ctx context.Context, alias string, input map[string]any) (map[string]any, error) {
+	entry := r.bound.entry(alias)
+	if entry == nil {
+		return nil, fmt.Errorf("bbsdk/steps: the bound chain carries no entry aliased %q", alias)
+	}
+	if entry.calls != nil {
+		// Rule 8b's ceiling and aggregate are per activation, and this hosting's activation IS the one
+		// call: the dispatcher is armed for it and closed when it returns. What finish folds is dropped —
+		// the aggregate rides a terminal status record, and this hosting writes none.
+		entry.calls.begin(ctx)
+		defer func() { _ = entry.calls.finish() }()
+	}
+	output, _, failure := r.execute(ctx, entry, input)
+	if failure != nil {
+		return nil, failure
+	}
+	return output, nil
+}
+
+// armCalls arms every calling entry's dispatcher for this activation (rule 8b).
+func (r *Runner) armCalls(ctx context.Context) {
+	discardWalk(r.bound.entries(func(entry *boundStep) error {
+		if entry.calls != nil {
+			entry.calls.begin(ctx)
+		}
+		return nil
+	}))
+}
+
+// closeCalls ends every dispatcher still open when the traversal returns.
+func (r *Runner) closeCalls() {
+	discardWalk(r.bound.entries(func(entry *boundStep) error {
+		if entry.calls != nil {
+			entry.calls.finish()
+		}
+		return nil
+	}))
+}
+
+// finishCalls ends one entry's calls and folds its per-slot aggregate for the terminal record about
+// to be written; an entry that calls nothing has none (steps_runtime.md §Status key).
+func finishCalls(entry *boundStep) map[string]any {
+	if entry.calls == nil {
+		return nil
+	}
+	return entry.calls.finish()
 }
 
 // branchResult is one branch's outcome: its output dict, or the failure its own budget ended on.
@@ -163,14 +240,18 @@ func (r *Runner) runBranch(
 		events <- transition{position: position, alias: alias, state: stateRunning}
 		output, duration, failure := r.execute(ctx, entry, input)
 		if failure == nil {
-			events <- transition{position: position, alias: alias, state: stateOK, durationMS: duration}
+			// The aggregate rides every terminal record, and the calls are ended before it is folded —
+			// so an abandoned call is named on the record rather than lost after it (rules 8, 8b).
+			events <- transition{position: position, alias: alias, state: stateOK,
+				durationMS: duration, components: finishCalls(entry)}
 			return branchResult{output: output}
 		}
 		if mayRetry(failure) && attempt < entry.spec.Retries && r.wait(ctx) {
 			attempt++
 			continue
 		}
-		events <- transition{position: position, alias: alias, state: stateError, err: failure}
+		events <- transition{position: position, alias: alias, state: stateError,
+			err: failure, components: finishCalls(entry)}
 		return branchResult{err: failure}
 	}
 }

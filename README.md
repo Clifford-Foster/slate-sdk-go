@@ -38,8 +38,8 @@ implements:
 
 | Contract | Version | Covers |
 | --- | --- | --- |
-| `contracts/bb_sdk_go.md` | 0.6.0 | `bbsdk`, `bbsdk/harness` |
-| `contracts/steps_runtime.md` | 0.11.1 | `bbsdk/steps` |
+| `contracts/bb_sdk_go.md` | 0.8.1 | `bbsdk`, `bbsdk/harness` |
+| `contracts/steps_runtime.md` | 0.13.1 | `bbsdk/steps` |
 | `contracts/sidecar.md` | 0.25.1 | the component ↔ sidecar boundary `bbsdk` speaks |
 | `contracts/blackboard_platform.md` | 0.34.1 | `blackboard` |
 | `contracts/manifest.md` | 0.13.2 | `manifest` |

@@ -17,6 +17,16 @@ type Teardowner interface {
 	Teardown(ctx context.Context) error
 }
 
+// Components is the call handle: one wired slot per call, dispatched by the runner (rule T2).
+type Components interface {
+	Call(ctx context.Context, slot string, payload map[string]any) (map[string]any, error)
+}
+
+// ComponentUser is the optional call half of the protocol; a step without one is a no-op (rule T2).
+type ComponentUser interface {
+	UseComponents(c Components)
+}
+
 // Provider is a step package's New: the runner calls it once per alias (rule T3).
 type Provider func() Step
 

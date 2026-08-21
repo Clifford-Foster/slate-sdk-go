@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"maps"
 	"slices"
 	"strings"
 
@@ -46,6 +47,11 @@ type boundStep struct {
 	inputSchema  *jsonschema.Schema
 	outputSchema *jsonschema.Schema
 	invoker      Invoker
+	// wired is the entry's bound components table in sorted slot order, which is the order rule 8's
+	// setup sweep visits them in — immediately after this entry's own.
+	wired []*boundStep
+	// calls is the entry's dispatcher, present only where the step implements the call half (rule T7).
+	calls *dispatcher
 }
 
 // Bind resolves every chain entry against the instance config and the supplied providers (rule T7).
@@ -69,6 +75,38 @@ func Bind(
 		bound.stages = append(bound.stages, resolved)
 	}
 	return bound, nil
+}
+
+// entries visits every bound entry in rule 8's sweep order: chain order — stage by stage, declaration
+// order inside a stage — with a wired component immediately after its calling entry's, in sorted slot
+// order, so the sweep visits an entry and then everything that entry calls before moving on.
+func (b *Bound) entries(visit func(*boundStep) error) error {
+	for _, stage := range b.stages {
+		for _, entry := range stage {
+			if err := visit(entry); err != nil {
+				return err
+			}
+			for _, wired := range entry.wired {
+				if err := visit(wired); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// entry finds one bound chain entry by alias. A wired component is reached through the entry that
+// calls it and is not addressable here, which is what makes the lookup the chain's own topology.
+func (b *Bound) entry(alias string) *boundStep {
+	for _, stage := range b.stages {
+		for _, entry := range stage {
+			if entry.spec.Alias == alias {
+				return entry
+			}
+		}
+	}
+	return nil
 }
 
 // bindOne resolves one entry: its binding from the instance config, then its object or its target.
@@ -117,7 +155,43 @@ func bindOne(
 	}
 	entry.step = object
 	entry.config = stepConfig(spec, config)
+	if err := bindWiring(entry, providers, schemas, config, invoker); err != nil {
+		return nil, err
+	}
 	return entry, nil
+}
+
+// bindWiring resolves the entry's components table exactly as a stage entry is resolved — its own
+// binding against its own legal set, its memory object from providers once per alias, its nats
+// dispatch to the invoker with no local object — and then hands the calling step's ComponentUser half
+// a Components over that result, once, before any traversal (rule T7).
+func bindWiring(
+	entry *boundStep,
+	providers map[string]Provider,
+	schemas fs.FS,
+	config map[string]any,
+	invoker Invoker,
+) error {
+	wiring := make(map[string]*boundStep, len(entry.spec.Components))
+	for _, slot := range slices.Sorted(maps.Keys(entry.spec.Components)) {
+		// The nesting is one level: a wired entry carries no components of its own (rule 14), so this
+		// resolution recurses no further than compose's document can.
+		wired, err := bindOne(entry.spec.Components[slot], providers, schemas, config, invoker)
+		if err != nil {
+			return err
+		}
+		wiring[slot] = wired
+		entry.wired = append(entry.wired, wired)
+	}
+	user, callsComponents := entry.step.(ComponentUser)
+	if !callsComponents {
+		// The half is probed once at bind by interface assertion, and its absence is a no-op — so no
+		// existing step changes.
+		return nil
+	}
+	entry.calls = newDispatcher(entry.spec.Alias, wiring, entry.spec.MaxComponentCalls)
+	user.UseComponents(entry.calls)
+	return nil
 }
 
 // resolveBinding reads step_<alias>_binding from the instance config, falling back to the document's

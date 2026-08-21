@@ -37,10 +37,15 @@ const (
 	stepOutputSchemaPath = "steps/step/output.json"
 )
 
-// bindingMemory is the only binding either driver runs: the harness is in-memory by invariant. It is
-// the canonical name, which is what the driver WRITES wherever it lays a binding value down; on the
-// read side both spellings are accepted (steps_runtime.md rule 10, test_harness.md rule 38).
+// bindingMemory is the binding either driver runs wherever memory is legal: the harness is in-memory
+// by invariant. It is the canonical name, which is what the driver WRITES wherever it lays a binding
+// value down; on the read side both spellings are accepted (steps_runtime.md rule 10,
+// test_harness.md rule 38).
 const bindingMemory = "memory"
+
+// bindingNATS is what an entry memory is not legal for is pinned to, dispatched to a registered
+// in-process responder rather than to transport (rule H18).
+const bindingNATS = "nats"
 
 // bindingAliasMemory is `memory`'s permanent parse alias, folded on read and never written.
 const bindingAliasMemory = "embedded"
@@ -68,6 +73,9 @@ type StepOptions struct {
 	OutputSchema []byte
 	// Validate disables both seam validations when it points at false; nil validates (rule H17).
 	Validate *bool
+	// Components drives a calling step's slots with fakes: slot name to responder. It is a fake and
+	// not a dispatch — no wired entry, so no wired schemas, no wired retries and no ceiling (rule H17).
+	Components map[string]func(ctx context.Context, payload map[string]any) (map[string]any, error)
 }
 
 // ChainOptions configures RunChain: the instance config, and the tree the seam schemas live in.
@@ -76,6 +84,9 @@ type ChainOptions struct {
 	Config map[string]any
 	// Schemas is the tree the document's declared seam-schema paths resolve against.
 	Schemas fs.FS
+	// Responders answer an entry memory is not legal for, keyed by service then endpoint exactly as
+	// Options.InvokeResponders is. A registered in-process responder is not transport (rule H18).
+	Responders map[string]map[string]InvokeFunc
 }
 
 // ChainRecord is one in-memory traversal: its output, every status write in the writer's order, and
@@ -125,6 +136,11 @@ func RunStep(ctx context.Context, step steps.Step, input map[string]any, opts St
 	if err != nil {
 		return nil, err
 	}
+	// The fake handle is installed after Bind, which is where the real dispatcher would have been
+	// handed over: RunStep drives one step with no chain and no wiring behind it, so the fakes win.
+	if user, callsComponents := step.(steps.ComponentUser); callsComponents {
+		user.UseComponents(componentFakes(opts.Components))
+	}
 	runner := steps.HarnessRunner(bound, board)
 	if err := runner.Start(ctx); err != nil {
 		// A Setup failure propagates raw: it is a startup failure, not a step failure (rule T6).
@@ -155,17 +171,11 @@ func RunChain(
 	}
 	for _, stage := range chain.Stages {
 		for _, spec := range stage.Steps {
-			// The rule-5 embed gate is enforced from the document: gate soundness wins over in-memory
-			// convenience, so a step forbidding embedding is a state error rather than a silent bind.
-			if !memoryBindable(spec.LegalBindings) {
-				return ChainRecord{}, fmt.Errorf(
-					"%w: step %q may not be bound %s (STEP_EMBED_FORBIDDEN)", ErrHarnessState, spec.Alias, bindingMemory)
-			}
-			config["step_"+spec.Alias+"_binding"] = bindingMemory
+			pinBinding(spec, config)
 		}
 	}
 	board := newChainBoard(chain.StatusKey, chain.InputKey, input)
-	bound, err := steps.Bind(chain, providers, opts.Schemas, config, nil)
+	bound, err := steps.Bind(chain, providers, opts.Schemas, config, responderInvoker{responders: opts.Responders})
 	if err != nil {
 		return ChainRecord{}, err
 	}
@@ -188,6 +198,73 @@ func RunChain(
 	}
 	record.Output = board.value(chain.OutputKey)
 	return record, nil
+}
+
+// pinBinding pins one entry's binding, and every entry its wiring carries: memory wherever memory is
+// legal for it, and otherwise the nats dispatch to a registered responder. The rule-5 embed gate is
+// enforced from the document — the driver never binds an entry memory against a legal set that
+// excludes it, so gate soundness survives the pin's move (rule H18).
+func pinBinding(spec steps.StepSpec, config map[string]any) {
+	binding := bindingNATS
+	if memoryBindable(spec.LegalBindings) {
+		binding = bindingMemory
+	}
+	config["step_"+spec.Alias+"_binding"] = binding
+	for _, wired := range spec.Components {
+		// A wired component is pinned on the same terms as a stage entry; without it a chain wiring an
+		// existing deployed component could not be driven here at all.
+		pinBinding(wired, config)
+	}
+}
+
+// componentFakes is rule H17's fake call handle: a mapping of slot to responder with nothing behind
+// it. It is a named type, as the handle is in both languages.
+type componentFakes map[string]func(ctx context.Context, payload map[string]any) (map[string]any, error)
+
+// Call answers from the mapping; a slot it does not carry is the ordinary *StepError wrapping
+// ErrComponentUnknown, exactly as an unresolved slot is at bind.
+func (c componentFakes) Call(ctx context.Context, slot string, payload map[string]any) (map[string]any, error) {
+	responder, wired := c[slot]
+	if !wired {
+		return nil, &steps.StepError{
+			Message:   fmt.Sprintf("COMPONENT_UNKNOWN: no fake is registered for slot %q", slot),
+			Cause:     steps.CauseInternal,
+			Retryable: false,
+			Err:       steps.ErrComponentUnknown,
+		}
+	}
+	return responder(ctx, payload)
+}
+
+// responderInvoker dispatches a nats-bound entry to a registered in-process responder (rule H18).
+type responderInvoker struct {
+	responders map[string]map[string]InvokeFunc
+}
+
+// Invoke answers from the registry; an unanswered target is INVOKE_NO_RESPONDERS on rule H14's terms,
+// which is what proves the registry live rather than the entry having been bound memory behind the
+// assertion's back.
+func (r responderInvoker) Invoke(
+	ctx context.Context,
+	service, endpoint string,
+	payload map[string]any,
+	_ ...bbsdk.InvokeOption,
+) (map[string]any, error) {
+	target := service + "." + endpoint
+	responder := r.responders[service][endpoint]
+	if responder == nil {
+		return nil, bbsdk.HarnessInvokeError(codeInvokeNoResponders,
+			fmt.Sprintf("no responder is registered for %q", target))
+	}
+	reply, err := responder(ctx, payload)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w",
+			bbsdk.HarnessInvokeError(codeInvokeServiceError, fmt.Sprintf("the %q responder failed", target)), err)
+	}
+	if reply == nil {
+		return map[string]any{}, nil
+	}
+	return reply, nil
 }
 
 // resolvedStepConfig applies rule H17's merge by presence: the declared defaults are laid down first

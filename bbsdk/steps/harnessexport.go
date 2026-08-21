@@ -11,7 +11,5 @@ package steps
 
 // HarnessRunner builds a runner whose retry backoff is not waited, for the rule-H18 chain driver.
 func HarnessRunner(b *Bound, board Board) *Runner {
-	runner := NewRunner(b, board)
-	runner.backoff = 0
-	return runner
+	return newRunner(b, board, 0)
 }

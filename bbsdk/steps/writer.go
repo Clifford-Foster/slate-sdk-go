@@ -19,6 +19,9 @@ type transition struct {
 	state      string
 	durationMS int
 	err        *StepError
+	// components is the entry's folded per-slot call aggregate, present on a terminal record of an
+	// entry that called components and nil everywhere else (steps_runtime.md §Status key).
+	components map[string]any
 }
 
 // statusWriter is one stage's single status writer: running and ok records as it receives them, the
@@ -100,6 +103,11 @@ func (w *statusWriter) record(event transition) map[string]any {
 	}
 	if event.state == stateOK {
 		value["duration_ms"] = event.durationMS
+	}
+	if event.components != nil {
+		// One member on a record that was going to be written anyway: however many calls a traversal
+		// makes, it performs exactly the status writes the same chain performs without them.
+		value["components"] = event.components
 	}
 	if event.err != nil {
 		value["error"] = map[string]any{

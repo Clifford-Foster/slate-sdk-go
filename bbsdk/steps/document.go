@@ -7,8 +7,10 @@ import (
 )
 
 // documentVersion is the one canonical-chain-document version this runtime knows. A document carrying
-// any other value is refused rather than guessed at (steps_runtime.md §Logical, rule T5).
-const documentVersion = 1
+// any other value is refused rather than guessed at — a 1 an older bb compose generate emitted
+// included, since a runtime that cannot read an entry's wiring must not run the chain wiring-less
+// (steps_runtime.md §Logical, rule T5).
+const documentVersion = 2
 
 // chainDocumentPath is where compose puts the document inside the embedded steps tree (rule 11a).
 const chainDocumentPath = "steps/chain.json"
@@ -34,6 +36,11 @@ type StepSpec struct {
 	Service           *ServiceTarget `json:"service"`
 	InputSchema       string         `json:"input_schema"`
 	OutputSchema      string         `json:"output_schema"`
+	// Components is the entry's wiring table, keyed by slot and one level deep; MaxComponentCalls is
+	// its effective per-activation ceiling. Both are absent from an entry that wires none, and both are
+	// compose's derived output — the decode re-derives neither and range-checks neither (rule T5).
+	Components        map[string]StepSpec `json:"components,omitempty"`
+	MaxComponentCalls int                 `json:"max_component_calls,omitempty"`
 }
 
 // Stage is one stage of the chain: a single step, or the 2 to 8 branches of a parallel group.
