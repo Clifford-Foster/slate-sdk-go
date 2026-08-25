@@ -1,4 +1,4 @@
-package steps
+package components
 
 import (
 	"context"
@@ -14,12 +14,18 @@ import (
 // retryBackoff is rule 8.4's fixed wait between attempts on a retryable failure.
 const retryBackoff = time.Second
 
+// errTraversalEnded marks the verdict the runner mints for a branch the traversal's end took before
+// it reached one of its own. Rule 8a classifies that branch as un-terminal at the stage's
+// resolution, and its record as cancellation-derived — the rank the writer flushes below a genuine
+// failure's.
+var errTraversalEnded = errors.New("bbsdk/components: the traversal ended before the component reached a verdict")
+
 // Runner executes one traversal of a bound chain per activation (rules 8, 8a).
 type Runner struct {
 	bound   *Bound
 	board   Board
 	backoff time.Duration
-	started []*boundStep
+	started []*boundComponent
 }
 
 // NewRunner builds a runner over the data plane; the three keys come from the chain document.
@@ -31,7 +37,7 @@ func NewRunner(b *Bound, board Board) *Runner {
 // component-call dispatcher alike — rule 8b puts the wired retries there, so the two must agree.
 func newRunner(b *Bound, board Board, backoff time.Duration) *Runner {
 	runner := &Runner{bound: b, board: board, backoff: backoff}
-	discardWalk(b.entries(func(entry *boundStep) error {
+	discardWalk(b.entries(func(entry *boundComponent) error {
 		if entry.calls != nil {
 			entry.calls.backoff = backoff
 		}
@@ -43,13 +49,13 @@ func newRunner(b *Bound, board Board, backoff time.Duration) *Runner {
 // discardWalk drops the error of a walk whose visitor cannot fail.
 func discardWalk(error) {}
 
-// Start runs Setup on every memory-bound step in chain order — stage by stage, declaration order
+// Start runs Setup on every memory-bound component in chain order — stage by stage, declaration order
 // inside a stage, and a wired component immediately after its calling entry's in sorted slot order —
 // returning the first failure unwrapped, since a setup failure is a startup failure and rule 3's
 // normalization is Run-scoped (rule T6).
 func (r *Runner) Start(ctx context.Context) error {
-	return r.bound.entries(func(entry *boundStep) error {
-		setuper, hasSetup := entry.step.(Setuper)
+	return r.bound.entries(func(entry *boundComponent) error {
+		setuper, hasSetup := entry.component.(Setuper)
 		if hasSetup {
 			if err := setuper.Setup(ctx, maps.Clone(entry.config)); err != nil {
 				return err
@@ -66,12 +72,12 @@ func (r *Runner) Stop(ctx context.Context) error {
 	var failures []error
 	for i := len(r.started) - 1; i >= 0; i-- {
 		entry := r.started[i]
-		teardowner, hasTeardown := entry.step.(Teardowner)
+		teardowner, hasTeardown := entry.component.(Teardowner)
 		if !hasTeardown {
 			continue
 		}
 		if err := teardowner.Teardown(ctx); err != nil {
-			failures = append(failures, fmt.Errorf("bbsdk/steps: teardown of step %q: %w", entry.spec.Alias, err))
+			failures = append(failures, fmt.Errorf("bbsdk/components: teardown of component %q: %w", entry.spec.Alias, err))
 		}
 	}
 	r.started = nil
@@ -88,7 +94,7 @@ func (r *Runner) Run(ctx context.Context, activationID string) error {
 	defer r.closeCalls()
 	entry, err := r.board.Get(ctx, r.bound.chain.InputKey)
 	if err != nil {
-		return fmt.Errorf("bbsdk/steps: reading the chain input key %q: %w", r.bound.chain.InputKey, err)
+		return fmt.Errorf("bbsdk/components: reading the chain input key %q: %w", r.bound.chain.InputKey, err)
 	}
 	if entry == nil {
 		// Rule 8.1: the one runner-level failure that writes no status record at all.
@@ -108,7 +114,7 @@ func (r *Runner) Run(ctx context.Context, activationID string) error {
 
 // RunEntry runs one bound entry once, with its dispatcher armed for the call (rule T13).
 //
-// This is the hosting a component-declaring step gets over RPC: there is no traversal, so no
+// This is the hosting a component-declaring component gets over RPC: there is no traversal, so no
 // input_key is read, no output_key or status key is written and the Board is not touched at all —
 // the input arrives from the caller and the output returns to it. The entry's own retries are not
 // applied, a rule-8.4 retry being a fresh `running` status write this hosting has no key for; a wired
@@ -117,7 +123,7 @@ func (r *Runner) Run(ctx context.Context, activationID string) error {
 func (r *Runner) RunEntry(ctx context.Context, alias string, input map[string]any) (map[string]any, error) {
 	entry := r.bound.entry(alias)
 	if entry == nil {
-		return nil, fmt.Errorf("bbsdk/steps: the bound chain carries no entry aliased %q", alias)
+		return nil, fmt.Errorf("bbsdk/components: the bound chain carries no entry aliased %q", alias)
 	}
 	if entry.calls != nil {
 		// Rule 8b's ceiling and aggregate are per activation, and this hosting's activation IS the one
@@ -135,7 +141,7 @@ func (r *Runner) RunEntry(ctx context.Context, alias string, input map[string]an
 
 // armCalls arms every calling entry's dispatcher for this activation (rule 8b).
 func (r *Runner) armCalls(ctx context.Context) {
-	discardWalk(r.bound.entries(func(entry *boundStep) error {
+	discardWalk(r.bound.entries(func(entry *boundComponent) error {
 		if entry.calls != nil {
 			entry.calls.begin(ctx)
 		}
@@ -145,7 +151,7 @@ func (r *Runner) armCalls(ctx context.Context) {
 
 // closeCalls ends every dispatcher still open when the traversal returns.
 func (r *Runner) closeCalls() {
-	discardWalk(r.bound.entries(func(entry *boundStep) error {
+	discardWalk(r.bound.entries(func(entry *boundComponent) error {
 		if entry.calls != nil {
 			entry.calls.finish()
 		}
@@ -154,8 +160,8 @@ func (r *Runner) closeCalls() {
 }
 
 // finishCalls ends one entry's calls and folds its per-slot aggregate for the terminal record about
-// to be written; an entry that calls nothing has none (steps_runtime.md §Status key).
-func finishCalls(entry *boundStep) map[string]any {
+// to be written; an entry that calls nothing has none (components_runtime.md §Status key).
+func finishCalls(entry *boundComponent) map[string]any {
 	if entry.calls == nil {
 		return nil
 	}
@@ -165,14 +171,14 @@ func finishCalls(entry *boundStep) map[string]any {
 // branchResult is one branch's outcome: its output dict, or the failure its own budget ended on.
 type branchResult struct {
 	output map[string]any
-	err    *StepError
+	err    *ComponentError
 }
 
-// runStage runs one stage — a single step, or every branch of a parallel group concurrently — and
+// runStage runs one stage — a single component, or every branch of a parallel group concurrently — and
 // performs every status write of it through one writer on this goroutine (rules 8, 8a).
 func (r *Runner) runStage(
 	ctx context.Context,
-	stage []*boundStep,
+	stage []*boundComponent,
 	input map[string]any,
 	index, total int,
 	activationID string,
@@ -215,7 +221,7 @@ func (r *Runner) runStage(
 		// Rule 8.6: the output_key PUT precedes the traversal's last status write, in every topology.
 		if _, err := r.board.Put(ctx, r.bound.chain.OutputKey, output); err != nil {
 			writer.close(ctx)
-			return nil, fmt.Errorf("bbsdk/steps: writing the chain output key %q: %w", r.bound.chain.OutputKey, err)
+			return nil, fmt.Errorf("bbsdk/components: writing the chain output key %q: %w", r.bound.chain.OutputKey, err)
 		}
 	}
 	writer.close(ctx)
@@ -225,11 +231,11 @@ func (r *Runner) runStage(
 	return output, nil
 }
 
-// runBranch runs one branch's whole per-step lifecycle — seam validation, its own timeout, its own
+// runBranch runs one branch's whole per-component lifecycle — seam validation, its own timeout, its own
 // retries with the fixed backoff, rule-3 normalization — emitting transitions instead of writing them.
 func (r *Runner) runBranch(
 	ctx context.Context,
-	entry *boundStep,
+	entry *boundComponent,
 	input map[string]any,
 	position int,
 	events chan<- transition,
@@ -251,7 +257,7 @@ func (r *Runner) runBranch(
 			continue
 		}
 		events <- transition{position: position, alias: alias, state: stateError,
-			err: failure, components: finishCalls(entry)}
+			err: failure, cancelled: errors.Is(failure, errTraversalEnded), components: finishCalls(entry)}
 		return branchResult{err: failure}
 	}
 }
@@ -272,12 +278,12 @@ func (r *Runner) wait(ctx context.Context) bool {
 }
 
 // execute runs one attempt: the rule-2 discipline and rule-6 validation at both seams, with the
-// step's own timeout around the call itself. duration_ms measures the successful call alone.
+// component's own timeout around the call itself. duration_ms measures the successful call alone.
 func (r *Runner) execute(
 	ctx context.Context,
-	entry *boundStep,
+	entry *boundComponent,
 	input map[string]any,
-) (map[string]any, int, *StepError) {
+) (map[string]any, int, *ComponentError) {
 	alias := entry.spec.Alias
 	encoded, failure := jsonDict(input, alias, "input")
 	if failure != nil {
@@ -302,20 +308,20 @@ func (r *Runner) execute(
 	return output, duration, nil
 }
 
-// outcome is one step call's return, carried off the goroutine the step ran on.
+// outcome is one component call's return, carried off the goroutine the component ran on.
 type outcome struct {
 	output map[string]any
-	err    *StepError
+	err    *ComponentError
 }
 
-// dispatch performs the one call the binding names, bounded by the step's own timeout_s. The call
-// runs on its own goroutine so an expired budget ends the attempt rather than waiting on a step that
+// dispatch performs the one call the communication names, bounded by the component's own timeout_s. The call
+// runs on its own goroutine so an expired budget ends the attempt rather than waiting on a component that
 // ignores its context, and a panic escaping Run there is recovered and normalized (rule T4).
 func (r *Runner) dispatch(
 	ctx context.Context,
-	entry *boundStep,
+	entry *boundComponent,
 	input map[string]any,
-) (map[string]any, *StepError) {
+) (map[string]any, *ComponentError) {
 	alias := entry.spec.Alias
 	callCtx := ctx
 	if entry.spec.TimeoutS > 0 {
@@ -330,12 +336,12 @@ func (r *Runner) dispatch(
 				done <- outcome{err: recovered(alias, value)}
 			}
 		}()
-		if entry.binding == bindingNATS {
+		if entry.communication == communicationNATS {
 			output, failure := invokeStep(callCtx, entry, input)
 			done <- outcome{output: output, err: failure}
 			return
 		}
-		output, err := entry.step.Run(callCtx, input)
+		output, err := entry.component.Run(callCtx, input)
 		if err != nil {
 			done <- outcome{err: normalize(alias, err)}
 			return
@@ -345,7 +351,7 @@ func (r *Runner) dispatch(
 	select {
 	case result := <-done:
 		if result.err != nil && expired(ctx, callCtx, entry) {
-			// A failure returned after the step's own budget expired is that expiry, however the step
+			// A failure returned after the component's own budget expired is that expiry, however the component
 			// spelled it — the classification cannot depend on which of the two the scheduler saw first.
 			return nil, timedOut(entry)
 		}
@@ -354,44 +360,46 @@ func (r *Runner) dispatch(
 		if expired(ctx, callCtx, entry) {
 			return nil, timedOut(entry)
 		}
-		return nil, stepError(CauseInternal, false, callCtx.Err(),
-			"step %q did not finish before the traversal ended: %s", alias, callCtx.Err())
+		// Rule 8a's classification: the component reached no verdict of its own, so this branch is
+		// un-terminal at the stage's resolution and its record is cancellation-derived.
+		return nil, stepError(CauseInternal, false, fmt.Errorf("%w: %w", errTraversalEnded, callCtx.Err()),
+			"component %q did not finish before the traversal ended: %s", alias, callCtx.Err())
 	}
 }
 
-// expired reports whether the step's own timeout_s ended the attempt, rather than the caller's context.
-func expired(ctx, callCtx context.Context, entry *boundStep) bool {
+// expired reports whether the component's own timeout_s ended the attempt, rather than the caller's context.
+func expired(ctx, callCtx context.Context, entry *boundComponent) bool {
 	return entry.spec.TimeoutS > 0 && errors.Is(callCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 }
 
-// timedOut is rule 8.3's verdict: an expiry is a retryable timeout StepError.
-func timedOut(entry *boundStep) *StepError {
+// timedOut is rule 8.3's verdict: an expiry is a retryable timeout ComponentError.
+func timedOut(entry *boundComponent) *ComponentError {
 	return stepError(CauseTimeout, true, context.DeadlineExceeded,
-		"step %q exceeded its %ds timeout", entry.spec.Alias, entry.spec.TimeoutS)
+		"component %q exceeded its %ds timeout", entry.spec.Alias, entry.spec.TimeoutS)
 }
 
 // mayRetry applies rule 6: a validation failure is never retried, whatever the budget says.
-func mayRetry(failure *StepError) bool {
+func mayRetry(failure *ComponentError) bool {
 	return failure.Retryable && failure.Cause != CauseValidation
 }
 
 // jsonDict enforces rule 2's JSON-dict discipline at one seam and returns the bytes a declared seam
-// schema validates, so an embedded step is held to exactly what a remote one would put on the wire.
-func jsonDict(value map[string]any, alias, seam string) ([]byte, *StepError) {
+// schema validates, so an embedded component is held to exactly what a remote one would put on the wire.
+func jsonDict(value map[string]any, alias, seam string) ([]byte, *ComponentError) {
 	if value == nil {
-		return nil, stepError(CauseInternal, false, nil, "step %q %s is not a dict", alias, seam)
+		return nil, stepError(CauseInternal, false, nil, "component %q %s is not a dict", alias, seam)
 	}
 	encoded, err := json.Marshal(value)
 	if err != nil {
 		return nil, stepError(CauseInternal, false, err,
-			"step %q %s is not JSON-serializable: %s", alias, seam, err)
+			"component %q %s is not JSON-serializable: %s", alias, seam, err)
 	}
 	return encoded, nil
 }
 
 // stageCapacity is the number of transitions a stage can produce: one running per attempt plus one
 // terminal record per branch.
-func stageCapacity(stage []*boundStep) int {
+func stageCapacity(stage []*boundComponent) int {
 	capacity := 0
 	for _, entry := range stage {
 		capacity += entry.spec.Retries + 2
@@ -399,10 +407,10 @@ func stageCapacity(stage []*boundStep) int {
 	return capacity
 }
 
-// gather applies rule 14's IO mapping: a single-step stage produces its step's output dict, and a
+// gather applies rule 14's IO mapping: a single-component stage produces its component's output dict, and a
 // parallel stage produces the stage input under _input plus one member per branch, in declaration
 // order — collision-free by construction, independent of completion order.
-func gather(stage []*boundStep, input map[string]any, results []branchResult) map[string]any {
+func gather(stage []*boundComponent, input map[string]any, results []branchResult) map[string]any {
 	if len(stage) == 1 {
 		return results[0].output
 	}
@@ -414,9 +422,9 @@ func gather(stage []*boundStep, input map[string]any, results []branchResult) ma
 	return gathered
 }
 
-// stageFailure is the stage's verdict: a single step's own failure, or rule 8a's aggregate naming
+// stageFailure is the stage's verdict: a single component's own failure, or rule 8a's aggregate naming
 // every failed branch with that branch's own cause.
-func stageFailure(stage []*boundStep, results []branchResult, index int) *StepError {
+func stageFailure(stage []*boundComponent, results []branchResult, index int) *ComponentError {
 	if len(stage) == 1 {
 		return results[0].err
 	}
@@ -428,7 +436,7 @@ func stageFailure(stage []*boundStep, results []branchResult, index int) *StepEr
 		if failure == nil {
 			continue
 		}
-		details = append(details, fmt.Sprintf("step %q (%s): %s", entry.spec.Alias, failure.Cause, failure.Message))
+		details = append(details, fmt.Sprintf("component %q (%s): %s", entry.spec.Alias, failure.Cause, failure.Message))
 		wrapped = append(wrapped, failure)
 		causes[failure.Cause] = struct{}{}
 	}

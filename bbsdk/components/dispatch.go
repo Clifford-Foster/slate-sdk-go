@@ -1,7 +1,7 @@
-// Contract: contracts/steps_runtime.md — rule 8b, the component-call dispatcher a calling step's
+// Contract: contracts/components_runtime.md — rule 8b, the component-call dispatcher a calling component's
 // Call arrives through, and the per-slot aggregate of §Status key.
 
-package steps
+package components
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 )
 
 // defaultMaxComponentCalls is MAX_COMPONENT_CALLS: the per-activation ceiling an entry whose document
-// carries no max_component_calls takes (steps_runtime.md §Chain definition, rule 8b).
+// carries no max_component_calls takes (components_runtime.md §Chain definition, rule 8b).
 const defaultMaxComponentCalls = 1000
 
 // abandonWait bounds the cancel-and-wait of rule 8b for a call whose wired entry declares no
@@ -19,7 +19,7 @@ const defaultMaxComponentCalls = 1000
 const abandonWait = 5 * time.Second
 
 // The three conditions rule 8b refuses a Call at its boundary under. No second error taxonomy is
-// minted for them: each is carried by the message of an internal, non-retryable StepError.
+// minted for them: each is carried by the message of an internal, non-retryable ComponentError.
 const (
 	codeComponentUnknown       = "COMPONENT_UNKNOWN"
 	codeComponentCallAbandoned = "COMPONENT_CALL_ABANDONED"
@@ -47,12 +47,12 @@ type inflightCall struct {
 }
 
 // dispatcher is one calling entry's component-call handle — the named type rule 8b's Call arrives
-// through. It is handed to the step once at Bind and re-armed per activation by the runner.
+// through. It is handed to the component once at Bind and re-armed per activation by the runner.
 type dispatcher struct {
 	// alias names the calling entry in the failures the dispatcher raises itself.
 	alias string
 	// wiring is the entry's components table, already bound; a slot it does not carry resolves to nothing.
-	wiring   map[string]*boundStep
+	wiring   map[string]*boundComponent
 	maxCalls int
 	backoff  time.Duration
 
@@ -69,7 +69,7 @@ type dispatcher struct {
 }
 
 // newDispatcher builds one calling entry's handle over its bound wiring.
-func newDispatcher(alias string, wiring map[string]*boundStep, maxCalls int) *dispatcher {
+func newDispatcher(alias string, wiring map[string]*boundComponent, maxCalls int) *dispatcher {
 	if maxCalls <= 0 {
 		maxCalls = defaultMaxComponentCalls
 	}
@@ -91,7 +91,7 @@ func (d *dispatcher) begin(ctx context.Context) {
 }
 
 // Call dispatches one component call: resolution, the boundary refusals, per-call seam validation at
-// both seams, the wired retries, and the aggregate — all of it the runner's, never the calling step's.
+// both seams, the wired retries, and the aggregate — all of it the runner's, never the calling component's.
 func (d *dispatcher) Call(ctx context.Context, slot string, payload map[string]any) (map[string]any, error) {
 	wired, failure := d.admit(slot)
 	if failure != nil {
@@ -108,7 +108,7 @@ func (d *dispatcher) Call(ctx context.Context, slot string, payload map[string]a
 
 // admit performs the three refusals rule 8b makes at the Call boundary, before anything is
 // dispatched, and takes the call's place under the ceiling when none of them fires.
-func (d *dispatcher) admit(slot string) (*boundStep, *StepError) {
+func (d *dispatcher) admit(slot string) (*boundComponent, *ComponentError) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	wired, resolved := d.wiring[slot]
@@ -116,16 +116,16 @@ func (d *dispatcher) admit(slot string) (*boundStep, *StepError) {
 		// Compose makes this unreachable for a chain it accepted; the runtime states it because a
 		// runtime handed a hand-written document must still fail honestly.
 		return nil, stepError(CauseInternal, false, ErrComponentUnknown,
-			"%s: step %q called slot %q, which its wiring does not resolve", codeComponentUnknown, d.alias, slot)
+			"%s: component %q called slot %q, which its wiring does not resolve", codeComponentUnknown, d.alias, slot)
 	}
 	if d.ended {
 		return nil, stepError(CauseInternal, false, nil,
-			"%s: step %q called slot %q after its traversal had ended",
+			"%s: component %q called slot %q after its traversal had ended",
 			codeComponentCallAbandoned, d.alias, slot)
 	}
 	if d.calls >= d.maxCalls {
 		return nil, stepError(CauseInternal, false, nil,
-			"%s: step %q reached its ceiling of %d component calls per activation",
+			"%s: component %q reached its ceiling of %d component calls per activation",
 			codeComponentCallLimit, d.alias, d.maxCalls)
 	}
 	d.calls++
@@ -138,9 +138,9 @@ func (d *dispatcher) admit(slot string) (*boundStep, *StepError) {
 func (d *dispatcher) attempts(
 	ctx context.Context,
 	slot string,
-	wired *boundStep,
+	wired *boundComponent,
 	payload map[string]any,
-) (map[string]any, *StepError) {
+) (map[string]any, *ComponentError) {
 	attempt := 0
 	for {
 		output, failure := d.validated(ctx, slot, wired, payload)
@@ -162,9 +162,9 @@ func (d *dispatcher) attempts(
 func (d *dispatcher) validated(
 	ctx context.Context,
 	slot string,
-	wired *boundStep,
+	wired *boundComponent,
 	payload map[string]any,
-) (map[string]any, *StepError) {
+) (map[string]any, *ComponentError) {
 	alias := wired.spec.Alias
 	encoded, failure := jsonDict(payload, alias, "input")
 	if failure != nil {
@@ -187,16 +187,16 @@ func (d *dispatcher) validated(
 	return output, nil
 }
 
-// dispatch performs the one call the wired entry's binding names. The call runs on its own recovering
+// dispatch performs the one call the wired entry's communication names. The call runs on its own recovering
 // goroutine — which is why a panic escaping a CALLED component's Run is normalized whatever goroutine
 // Call was made from (rule T4) — and cancellation cancels it and then WAITS for it, bounded by that
 // call's own budget: a deliberate divergence from the stage path, which abandons rather than waits.
 func (d *dispatcher) dispatch(
 	ctx context.Context,
 	slot string,
-	wired *boundStep,
+	wired *boundComponent,
 	payload map[string]any,
-) (map[string]any, *StepError) {
+) (map[string]any, *ComponentError) {
 	parent := d.traversalContext()
 	callCtx, cancel := context.WithCancel(parent)
 	defer cancel()
@@ -224,12 +224,12 @@ func (d *dispatcher) dispatch(
 				done <- outcome{err: recovered(wired.spec.Alias, value)}
 			}
 		}()
-		if wired.binding == bindingNATS {
+		if wired.communication == communicationNATS {
 			output, failure := invokeStep(callCtx, wired, payload)
 			done <- outcome{output: output, err: failure}
 			return
 		}
-		output, err := wired.step.Run(callCtx, payload)
+		output, err := wired.component.Run(callCtx, payload)
 		if err != nil {
 			done <- outcome{err: normalize(wired.spec.Alias, err)}
 			return
@@ -252,7 +252,7 @@ func (d *dispatcher) dispatch(
 			// running, and proceeds to its terminal write.
 			d.markAbandoned(slot)
 			return nil, stepError(CauseInternal, false, callCtx.Err(),
-				"%s: step %q left its call on slot %q running: %s",
+				"%s: component %q left its call on slot %q running: %s",
 				codeComponentCallAbandoned, d.alias, slot, callCtx.Err())
 		}
 	}
@@ -263,8 +263,8 @@ func (d *dispatcher) dispatch(
 func (d *dispatcher) classify(
 	result outcome,
 	parent, callCtx context.Context,
-	wired *boundStep,
-) (map[string]any, *StepError) {
+	wired *boundComponent,
+) (map[string]any, *ComponentError) {
 	if wired.spec.TimeoutS > 0 && errors.Is(callCtx.Err(), context.DeadlineExceeded) && parent.Err() == nil {
 		return nil, timedOut(wired)
 	}
@@ -326,7 +326,7 @@ func (d *dispatcher) fold() map[string]any {
 	return aggregate
 }
 
-// record folds one finished call into its slot's totals, under the dispatcher's own exclusion: a step
+// record folds one finished call into its slot's totals, under the dispatcher's own exclusion: a component
 // may call several slots concurrently, and the single writer reads the result at the terminal write.
 func (d *dispatcher) record(slot string, spent time.Duration, failed bool) {
 	d.mu.Lock()
@@ -353,11 +353,11 @@ func (d *dispatcher) markAbandoned(slot string) {
 }
 
 // slotTotals is the slot's aggregate member, minted on its first call. The caller holds the lock.
-func (d *dispatcher) slotTotals(slot string, wired *boundStep) *slotTotals {
+func (d *dispatcher) slotTotals(slot string, wired *boundComponent) *slotTotals {
 	totals, present := d.totals[slot]
 	if !present {
 		totals = &slotTotals{}
-		if wired.binding == bindingNATS && wired.spec.Service != nil {
+		if wired.communication == communicationNATS && wired.spec.Service != nil {
 			// The target records which service was called, never which build answered it (rule 15).
 			totals.target = wired.spec.Service.Name + "." + wired.spec.Service.Endpoint
 		}

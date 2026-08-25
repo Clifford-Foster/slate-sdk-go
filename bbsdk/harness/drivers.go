@@ -1,6 +1,6 @@
-// Contract: contracts/bb_sdk_go.md — rules H17 and H18, the step and chain drivers.
+// Contract: contracts/bb_sdk_go.md — rules H17 and H18, the component and chain drivers.
 //
-// Both drive the real bbsdk/steps runner over an in-memory board: setup, seam validation, rule-3
+// Both drive the real bbsdk/components runner over an in-memory board: setup, seam validation, rule-3
 // normalization, the rule-8 and rule-8a traversal — including a parallel stage's real goroutine
 // concurrency — all come from the runner itself, never from a driver-local re-implementation.
 // Nothing leaves the process: the status key is an in-memory sink and no file is ever read (rule H16).
@@ -18,69 +18,69 @@ import (
 	"testing/fstest"
 
 	bbsdk "github.com/Clifford-Foster/slate-sdk-go/bbsdk"
-	"github.com/Clifford-Foster/slate-sdk-go/bbsdk/steps"
+	"github.com/Clifford-Foster/slate-sdk-go/bbsdk/components"
 )
 
-// The one-stage chain RunStep drives its step over, and the activation ids both drivers pin.
+// The one-stage chain RunComponent drives its component over, and the activation ids both drivers pin.
 const (
-	stepAlias         = "step"
-	stepInputKey      = "harness.step.input"
-	stepOutputKey     = "harness.step.output"
-	stepStatusKey     = "harness.step.status"
-	stepActivationID  = "step-1"
+	stepAlias         = "component"
+	stepInputKey      = "harness.component.input"
+	stepOutputKey     = "harness.component.output"
+	stepStatusKey     = "harness.component.status"
+	stepActivationID  = "component-1"
 	chainActivationID = "chain-1"
 )
 
 // The paths the supplied seam schemas are mounted at inside the driver's in-memory schema tree.
 const (
-	stepInputSchemaPath  = "steps/step/input.json"
-	stepOutputSchemaPath = "steps/step/output.json"
+	stepInputSchemaPath  = "components/component/input.json"
+	stepOutputSchemaPath = "components/component/output.json"
 )
 
-// bindingMemory is the binding either driver runs wherever memory is legal: the harness is in-memory
-// by invariant. It is the canonical name, which is what the driver WRITES wherever it lays a binding
-// value down; on the read side both spellings are accepted (steps_runtime.md rule 10,
+// communicationMemory is the communication either driver runs wherever memory is legal: the harness is in-memory
+// by invariant. It is the canonical name, which is what the driver WRITES wherever it lays a communication
+// value down; on the read side both spellings are accepted (components_runtime.md rule 10,
 // test_harness.md rule 38).
-const bindingMemory = "memory"
+const communicationMemory = "memory"
 
-// bindingNATS is what an entry memory is not legal for is pinned to, dispatched to a registered
+// communicationNATS is what an entry memory is not legal for is pinned to, dispatched to a registered
 // in-process responder rather than to transport (rule H18).
-const bindingNATS = "nats"
+const communicationNATS = "nats"
 
-// bindingAliasMemory is `memory`'s permanent parse alias, folded on read and never written.
-const bindingAliasMemory = "embedded"
+// communicationAliasMemory is `memory`'s permanent parse alias, folded on read and never written.
+const communicationAliasMemory = "embedded"
 
-// memoryBindable reports whether a document's legal set admits the memory binding, folding both
+// memoryBindable reports whether a document's legal set admits the memory communication, folding both
 // operands of the membership test so an authored chain in the alias spelling gates identically to
 // its canonical twin (test_harness.md rule 38).
 func memoryBindable(legal []string) bool {
 	for _, value := range legal {
-		if value == bindingMemory || value == bindingAliasMemory {
+		if value == communicationMemory || value == communicationAliasMemory {
 			return true
 		}
 	}
 	return false
 }
 
-// StepOptions configures RunStep: the step's config, its declared defaults, and its seam schemas.
-type StepOptions struct {
+// ComponentOptions configures RunComponent: the component's config, its declared defaults, and its seam schemas.
+type ComponentOptions struct {
 	// Config is the config the caller supplies; it is merged over Defaults by presence (rule H17).
 	Config map[string]any
-	// Defaults stands in for the step's step.toml-declared defaults, which rule H16 forbids reading.
+	// Defaults stands in for the component's bb.toml-declared defaults, which rule H16 forbids reading.
 	Defaults map[string]any
 	// InputSchema and OutputSchema are draft 2020-12 documents; an empty one declares no seam.
 	InputSchema  []byte
 	OutputSchema []byte
 	// Validate disables both seam validations when it points at false; nil validates (rule H17).
 	Validate *bool
-	// Components drives a calling step's slots with fakes: slot name to responder. It is a fake and
+	// Components drives a calling component's slots with fakes: slot name to responder. It is a fake and
 	// not a dispatch — no wired entry, so no wired schemas, no wired retries and no ceiling (rule H17).
 	Components map[string]func(ctx context.Context, payload map[string]any) (map[string]any, error)
 }
 
 // ChainOptions configures RunChain: the instance config, and the tree the seam schemas live in.
 type ChainOptions struct {
-	// Config is the instance config; its rule-10 binding fields are ignored, the rest reaches the steps.
+	// Config is the instance config; its rule-10 communication fields are ignored, the rest reaches the components.
 	Config map[string]any
 	// Schemas is the tree the document's declared seam-schema paths resolve against.
 	Schemas fs.FS
@@ -96,21 +96,21 @@ type ChainRecord struct {
 	Output map[string]any
 	// Statuses is every status write, in the order the single writer performed it.
 	Statuses []map[string]any
-	// Err is the terminal StepError, nil when the traversal succeeded.
+	// Err is the terminal ComponentError, nil when the traversal succeeded.
 	Err error
 }
 
-// RunStep drives one step through the real runner over a one-stage chain (rule H17).
-func RunStep(ctx context.Context, step steps.Step, input map[string]any, opts StepOptions) (map[string]any, error) {
-	if step == nil {
-		return nil, fmt.Errorf("%w: RunStep needs a step to run", ErrHarnessState)
+// RunComponent drives one component through the real runner over a one-stage chain (rule H17).
+func RunComponent(ctx context.Context, component components.Component, input map[string]any, opts ComponentOptions) (map[string]any, error) {
+	if component == nil {
+		return nil, fmt.Errorf("%w: RunComponent needs a component to run", ErrHarnessState)
 	}
-	spec := steps.StepSpec{
-		Alias:         stepAlias,
-		Step:          stepAlias,
-		Binding:       bindingMemory,
-		LegalBindings: []string{bindingMemory},
-		Config:        resolvedStepConfig(opts),
+	spec := components.ComponentSpec{
+		Alias:               stepAlias,
+		Component:           stepAlias,
+		Communication:       communicationMemory,
+		LegalCommunications: []string{communicationMemory},
+		Config:              resolvedStepConfig(opts),
 	}
 	schemas := fstest.MapFS{}
 	if opts.Validate == nil || *opts.Validate {
@@ -123,27 +123,27 @@ func RunStep(ctx context.Context, step steps.Step, input map[string]any, opts St
 			spec.OutputSchema = stepOutputSchemaPath
 		}
 	}
-	chain := steps.Chain{
+	chain := components.Chain{
 		Name:      stepAlias,
 		InputKey:  stepInputKey,
 		OutputKey: stepOutputKey,
 		StatusKey: stepStatusKey,
-		Stages:    []steps.Stage{{Steps: []steps.StepSpec{spec}}},
+		Stages:    []components.Stage{{Components: []components.ComponentSpec{spec}}},
 	}
-	providers := map[string]steps.Provider{stepAlias: func() steps.Step { return step }}
+	providers := map[string]components.Provider{stepAlias: func() components.Component { return component }}
 	board := newChainBoard(chain.StatusKey, chain.InputKey, input)
-	bound, err := steps.Bind(chain, providers, schemas, nil, nil)
+	bound, err := components.Bind(chain, providers, schemas, nil, nil)
 	if err != nil {
 		return nil, err
 	}
 	// The fake handle is installed after Bind, which is where the real dispatcher would have been
-	// handed over: RunStep drives one step with no chain and no wiring behind it, so the fakes win.
-	if user, callsComponents := step.(steps.ComponentUser); callsComponents {
+	// handed over: RunComponent drives one component with no chain and no wiring behind it, so the fakes win.
+	if user, callsComponents := component.(components.ComponentUser); callsComponents {
 		user.UseComponents(componentFakes(opts.Components))
 	}
-	runner := steps.HarnessRunner(bound, board)
+	runner := components.HarnessRunner(bound, board)
 	if err := runner.Start(ctx); err != nil {
-		// A Setup failure propagates raw: it is a startup failure, not a step failure (rule T6).
+		// A Setup failure propagates raw: it is a startup failure, not a component failure (rule T6).
 		return nil, err
 	}
 	defer func() { discard(runner.Stop(ctx)) }()
@@ -153,15 +153,15 @@ func RunStep(ctx context.Context, step steps.Step, input map[string]any, opts St
 	return board.value(chain.OutputKey), nil
 }
 
-// RunChain drives a whole chain document in memory, binding every step memory (rule H18).
+// RunChain drives a whole chain document in memory, communication every component memory (rule H18).
 func RunChain(
 	ctx context.Context,
 	document []byte,
-	providers map[string]steps.Provider,
+	providers map[string]components.Provider,
 	input map[string]any,
 	opts ChainOptions,
 ) (ChainRecord, error) {
-	chain, err := steps.ParseChain(document)
+	chain, err := components.ParseChain(document)
 	if err != nil {
 		return ChainRecord{}, err
 	}
@@ -170,16 +170,16 @@ func RunChain(
 		config = map[string]any{}
 	}
 	for _, stage := range chain.Stages {
-		for _, spec := range stage.Steps {
+		for _, spec := range stage.Components {
 			pinBinding(spec, config)
 		}
 	}
 	board := newChainBoard(chain.StatusKey, chain.InputKey, input)
-	bound, err := steps.Bind(chain, providers, opts.Schemas, config, responderInvoker{responders: opts.Responders})
+	bound, err := components.Bind(chain, providers, opts.Schemas, config, responderInvoker{responders: opts.Responders})
 	if err != nil {
 		return ChainRecord{}, err
 	}
-	runner := steps.HarnessRunner(bound, board)
+	runner := components.HarnessRunner(bound, board)
 	if err := runner.Start(ctx); err != nil {
 		return ChainRecord{}, err
 	}
@@ -187,10 +187,10 @@ func RunChain(
 	failure := runner.Run(ctx, chainActivationID)
 	record := ChainRecord{Statuses: board.statusWrites()}
 	if failure != nil {
-		var verdict *steps.StepError
+		var verdict *components.ComponentError
 		if !errors.As(failure, &verdict) {
 			// A driver-level failure — an unbindable chain, a board fault — is the call's own error;
-			// only a step failure lands on the record.
+			// only a component failure lands on the record.
 			return record, failure
 		}
 		record.Err = verdict
@@ -200,17 +200,17 @@ func RunChain(
 	return record, nil
 }
 
-// pinBinding pins one entry's binding, and every entry its wiring carries: memory wherever memory is
+// pinBinding pins one entry's communication, and every entry its wiring carries: memory wherever memory is
 // legal for it, and otherwise the nats dispatch to a registered responder. The rule-5 embed gate is
 // enforced from the document — the driver never binds an entry memory against a legal set that
 // excludes it, so gate soundness survives the pin's move (rule H18).
-func pinBinding(spec steps.StepSpec, config map[string]any) {
-	binding := bindingNATS
-	if memoryBindable(spec.LegalBindings) {
-		binding = bindingMemory
+func pinBinding(spec components.ComponentSpec, config map[string]any) {
+	communication := communicationNATS
+	if memoryBindable(spec.LegalCommunications) {
+		communication = communicationMemory
 	}
-	config["step_"+spec.Alias+"_binding"] = binding
-	for _, wired := range spec.Components {
+	config["component_"+spec.Alias+"_communication"] = communication
+	for _, wired := range spec.Calls {
 		// A wired component is pinned on the same terms as a stage entry; without it a chain wiring an
 		// existing deployed component could not be driven here at all.
 		pinBinding(wired, config)
@@ -221,16 +221,16 @@ func pinBinding(spec steps.StepSpec, config map[string]any) {
 // it. It is a named type, as the handle is in both languages.
 type componentFakes map[string]func(ctx context.Context, payload map[string]any) (map[string]any, error)
 
-// Call answers from the mapping; a slot it does not carry is the ordinary *StepError wrapping
+// Call answers from the mapping; a slot it does not carry is the ordinary *ComponentError wrapping
 // ErrComponentUnknown, exactly as an unresolved slot is at bind.
 func (c componentFakes) Call(ctx context.Context, slot string, payload map[string]any) (map[string]any, error) {
 	responder, wired := c[slot]
 	if !wired {
-		return nil, &steps.StepError{
+		return nil, &components.ComponentError{
 			Message:   fmt.Sprintf("COMPONENT_UNKNOWN: no fake is registered for slot %q", slot),
-			Cause:     steps.CauseInternal,
+			Cause:     components.CauseInternal,
 			Retryable: false,
-			Err:       steps.ErrComponentUnknown,
+			Err:       components.ErrComponentUnknown,
 		}
 	}
 	return responder(ctx, payload)
@@ -270,7 +270,7 @@ func (r responderInvoker) Invoke(
 // resolvedStepConfig applies rule H17's merge by presence: the declared defaults are laid down first
 // and the supplied config is merged over them, an explicitly supplied nil included, with undeclared
 // supplied keys passed through verbatim and no rule-10 namespacing.
-func resolvedStepConfig(opts StepOptions) map[string]any {
+func resolvedStepConfig(opts ComponentOptions) map[string]any {
 	resolved := map[string]any{}
 	maps.Copy(resolved, opts.Defaults)
 	maps.Copy(resolved, opts.Config)
@@ -329,6 +329,6 @@ func (b *chainBoard) statusWrites() []map[string]any {
 	return slices.Clone(b.statuses)
 }
 
-// discard swallows a failure the contract says is best-effort and never raised (steps_runtime.md
+// discard swallows a failure the contract says is best-effort and never raised (components_runtime.md
 // rule 8's teardown sweep).
 func discard(error) {}

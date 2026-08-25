@@ -25,6 +25,7 @@ var (
 	semverRE           = regexp.MustCompile(`^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$`)
 	tagRE              = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
 	configNameRE       = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+	payloadAliasRE     = regexp.MustCompile(`^[a-z][a-z0-9_]{0,32}$`)
 	arbitrationGroupRE = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
 	urlRE              = regexp.MustCompile(`(?i)^https?://`)
 	readRE             = regexp.MustCompile(`^(?:[A-Za-z0-9_]+|\*)(?:\.(?:[A-Za-z0-9_]+|\*))*(?:\.>)?$`)
@@ -47,9 +48,10 @@ var (
 	endpointFields    = set("name", "subject", "description")
 	discoveryFields   = set("category", "skills", "metadata")
 	skillFields       = set("id", "name", "description", "tags", "examples")
-	componentFields   = set("delivery", "activate_url", "event_url", "rpc_url", "timeout_s")
+	componentFields   = set("delivery", "activate_url", "event_url", "rpc_url", "timeout_s", "payloads")
 	configFields      = set("fields")
 	configFieldFields = set("name", "type", "required", "secret", "description", "enum", "default")
+	payloadFields     = set("alias", "name", "version", "config")
 )
 
 // List, string, and size limits the schema tables declare.
@@ -71,6 +73,7 @@ const (
 	maxTimeoutS          = 3600
 	maxConfigFields      = 32
 	maxConfigDescription = 200
+	maxPayloads          = 32
 )
 
 // fieldOrder is the document order findings sort by; an unlisted first segment sorts last (rule 4).
@@ -742,6 +745,7 @@ func (v *validator) component(raw any, hasEvents, hasService bool) {
 	}
 
 	v.timeout(block)
+	v.payloads(block)
 
 	if deliveryValid && delivery == deliveryPull && hasService {
 		v.add("DELIVERY_UNSUPPORTED", "component", "delivery: pull with a service is unsupported in this version")
@@ -829,6 +833,87 @@ func (v *validator) timeout(block map[string]any) {
 	if seconds < minTimeoutS || seconds > maxTimeoutS {
 		v.add("TIMEOUT_INVALID", "component.timeout_s",
 			fmt.Sprintf("component.timeout_s must be in [%d, %d]", minTimeoutS, maxTimeoutS))
+	}
+}
+
+// --- payloads (rule 32) ---
+
+// payloads validates the delivered-payload declarations: four required members each, no cross-check
+// against this document's own config block (rule 32).
+func (v *validator) payloads(block map[string]any) {
+	raw, present := block["payloads"]
+	if !present {
+		return
+	}
+	entries, ok := raw.([]any)
+	if !ok {
+		v.add("FIELD_TYPE", "component.payloads", "component.payloads must be a list")
+		return
+	}
+	if len(entries) > maxPayloads {
+		v.add("LIMIT_EXCEEDED", "component.payloads", fmt.Sprintf("at most %d payloads", maxPayloads))
+	}
+	seen := map[string]bool{}
+	for i, entry := range entries {
+		v.payload(entry, fmt.Sprintf("component.payloads[%d]", i), seen)
+	}
+}
+
+// payload validates one declaration; every finding uses an existing error family (rule 32).
+func (v *validator) payload(declared any, base string, seen map[string]bool) {
+	entry, ok := declared.(map[string]any)
+	if !ok {
+		v.add("FIELD_TYPE", base, "payload must be a mapping")
+		return
+	}
+	v.unknownFields(entry, payloadFields, base+".")
+	v.payloadAlias(entry, base+".alias", seen)
+	v.payloadMember(entry, "name", base+".name", nameRE, "NAME_INVALID",
+		"does not match ^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+	v.payloadMember(entry, "version", base+".version", semverRE, "VERSION_INVALID",
+		"is not a valid semantic version")
+	v.payloadMember(entry, "config", base+".config", configNameRE, "NAME_INVALID",
+		"does not match ^[a-z][a-z0-9_]{0,63}$")
+}
+
+// payloadAlias validates the delivery slot's name and its uniqueness within the list.
+func (v *validator) payloadAlias(entry map[string]any, path string, seen map[string]bool) {
+	raw, present := entry["alias"]
+	if !present {
+		v.add("FIELD_REQUIRED", path, path+" is required")
+		return
+	}
+	text, ok := raw.(string)
+	if !ok {
+		v.add("FIELD_TYPE", path, path+" must be a string")
+		return
+	}
+	if !payloadAliasRE.MatchString(text) {
+		v.add("NAME_INVALID", path, fmt.Sprintf("%s does not match ^[a-z][a-z0-9_]{0,32}$", pyQuote(text)))
+		return
+	}
+	if seen[text] {
+		v.add("DUPLICATE_ENTRY", path, fmt.Sprintf("Duplicate payload alias %s", pyQuote(text)))
+	}
+	seen[text] = true
+}
+
+// payloadMember validates one required string member against its grammar.
+func (v *validator) payloadMember(
+	entry map[string]any, key, path string, grammar *regexp.Regexp, code, detail string,
+) {
+	raw, present := entry[key]
+	if !present {
+		v.add("FIELD_REQUIRED", path, path+" is required")
+		return
+	}
+	text, ok := raw.(string)
+	if !ok {
+		v.add("FIELD_TYPE", path, path+" must be a string")
+		return
+	}
+	if !grammar.MatchString(text) {
+		v.add(code, path, fmt.Sprintf("%s %s", pyQuote(text), detail))
 	}
 }
 

@@ -1,4 +1,4 @@
-package steps
+package components
 
 import (
 	"context"
@@ -18,9 +18,12 @@ type transition struct {
 	alias      string
 	state      string
 	durationMS int
-	err        *StepError
+	err        *ComponentError
+	// cancelled marks a terminal error record as rule 8a's cancellation-derived one — a branch the
+	// traversal's end took before it reached a verdict — which the flush ranks below a genuine failure.
+	cancelled bool
 	// components is the entry's folded per-slot call aggregate, present on a terminal record of an
-	// entry that called components and nil everywhere else (steps_runtime.md §Status key).
+	// entry that called components and nil everywhere else (components_runtime.md §Status key).
 	components map[string]any
 }
 
@@ -61,7 +64,8 @@ func (w *statusWriter) accept(ctx context.Context, event transition) {
 	w.put(ctx, event)
 }
 
-// close flushes everything withheld: the held ok first, then the error records in declaration order.
+// close flushes everything withheld: the held ok first, then the error records in rule 8a's two
+// ranks — cancellation-derived first, genuine failures second, each rank in declaration order.
 func (w *statusWriter) close(ctx context.Context) {
 	if w.held != nil {
 		held := *w.held
@@ -70,10 +74,25 @@ func (w *statusWriter) close(ctx context.Context) {
 	}
 	failures := w.failures
 	w.failures = nil
-	slices.SortStableFunc(failures, func(a, b transition) int { return a.position - b.position })
+	slices.SortStableFunc(failures, func(a, b transition) int {
+		if a.cancelled != b.cancelled {
+			// A cancellation artefact never displaces a real failure: the stage rests on the
+			// last-declared genuine failure when it had one, on the last cancellation record when not.
+			return boolRank(a.cancelled) - boolRank(b.cancelled)
+		}
+		return a.position - b.position
+	})
 	for _, event := range failures {
 		w.put(ctx, event)
 	}
+}
+
+// boolRank orders a cancellation-derived record ahead of a genuine failure's.
+func boolRank(cancelled bool) int {
+	if cancelled {
+		return 0
+	}
+	return 1
 }
 
 // put performs one status PUT. A terminal record is written under a context detached from the
@@ -87,15 +106,15 @@ func (w *statusWriter) put(ctx context.Context, event transition) {
 		writeCtx = detached
 	}
 	if _, err := w.board.Put(writeCtx, w.key, w.record(event)); err != nil && w.err == nil {
-		w.err = fmt.Errorf("bbsdk/steps: writing the status key %q: %w", w.key, err)
+		w.err = fmt.Errorf("bbsdk/components: writing the status key %q: %w", w.key, err)
 	}
 }
 
-// record builds the status value: one dict per transition, overwritten in place (steps_runtime.md
+// record builds the status value: one dict per transition, overwritten in place (components_runtime.md
 // §Status key).
 func (w *statusWriter) record(event transition) map[string]any {
 	value := map[string]any{
-		"step":          event.alias,
+		"component":     event.alias,
 		"index":         w.index,
 		"of":            w.of,
 		"state":         event.state,

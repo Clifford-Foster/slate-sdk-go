@@ -1,4 +1,4 @@
-package steps
+package components
 
 import (
 	"bytes"
@@ -25,7 +25,7 @@ type refusingLoader struct{}
 
 // Load refuses every external reference.
 func (refusingLoader) Load(url string) (any, error) {
-	return nil, fmt.Errorf("bbsdk/steps: a seam schema may not reference %s — it must be self-contained", url)
+	return nil, fmt.Errorf("bbsdk/components: a seam schema may not reference %s — it must be self-contained", url)
 }
 
 // compileSeamSchema compiles one declared seam schema out of the embedded tree; an undeclared seam
@@ -66,10 +66,10 @@ func compileSeamSchema(schemas fs.FS, alias, path string) (*jsonschema.Schema, e
 	return compiled, nil
 }
 
-// seamSchemaError names the step alias, the declared schema path and what refused the schema, over
+// seamSchemaError names the component alias, the declared schema path and what refused the schema, over
 // the one sentinel a caller discriminates the class by (rule T12).
 func seamSchemaError(alias, path string, err error) error {
-	return fmt.Errorf("%w: step %q seam schema %q: %w", ErrSeamSchemaInvalid, alias, path, err)
+	return fmt.Errorf("%w: component %q seam schema %q: %w", ErrSeamSchemaInvalid, alias, path, err)
 }
 
 // checkSelfContained applies rule T12's structural half: every $ref the document carries is a
@@ -198,21 +198,21 @@ func sortedMembers(object map[string]any) []string {
 	return slices.Sorted(maps.Keys(object))
 }
 
-// validateSeam applies rule 6 to one seam: a violation is a validation StepError naming the step and
-// the JSON-Schema error path, and rule 6 makes it non-retryable whatever the step's retry budget is.
-func validateSeam(schema *jsonschema.Schema, encoded []byte, alias, seam string) *StepError {
+// validateSeam applies rule 6 to one seam: a violation is a validation ComponentError naming the component and
+// the JSON-Schema error path, and rule 6 makes it non-retryable whatever the component's retry budget is.
+func validateSeam(schema *jsonschema.Schema, encoded []byte, alias, seam string) *ComponentError {
 	if schema == nil {
 		return nil
 	}
 	// The instance is validated from the bytes the rule-2 discipline already produced, so what the
-	// schema sees is exactly what a remote binding would put on the wire.
+	// schema sees is exactly what a remote communication would put on the wire.
 	instance, err := jsonschema.UnmarshalJSON(bytes.NewReader(encoded))
 	if err != nil {
-		return stepError(CauseInternal, false, err, "step %q %s could not be re-read as JSON: %s", alias, seam, err)
+		return stepError(CauseInternal, false, err, "component %q %s could not be re-read as JSON: %s", alias, seam, err)
 	}
 	if err := schema.Validate(instance); err != nil {
 		return stepError(CauseValidation, false, err,
-			"step %q %s failed schema validation at %s", alias, seam, violationPath(err))
+			"component %q %s failed schema validation at %s", alias, seam, violationPath(err))
 	}
 	return nil
 }

@@ -42,6 +42,14 @@ type Discovery struct {
 	Metadata map[string]any
 }
 
+// Payload is one published component payload a unit requires delivered before its container starts (rule 32).
+type Payload struct {
+	Alias   string
+	Name    string
+	Version string
+	Config  string
+}
+
 // Component is a manifest's component block: the delivery mode and the sidecar's callback URLs.
 type Component struct {
 	Delivery string
@@ -51,6 +59,8 @@ type Component struct {
 	RPCURL      string
 	// TimeoutS is the per-activation budget in seconds, zero when the manifest declares none.
 	TimeoutS int
+	// Payloads are the published payloads delivered before the component container starts, empty when none are declared.
+	Payloads []Payload
 }
 
 // Manifest is a validated component manifest with every default applied.
@@ -179,6 +189,18 @@ func (m *Manifest) ToMap() map[string]any {
 	if m.Component.TimeoutS != 0 {
 		component["timeout_s"] = m.Component.TimeoutS
 	}
+	// Rule 32: payloads ride the round trip only when declared, so a payload-free manifest is
+	// byte-for-byte the document it was before the rule existed.
+	if len(m.Component.Payloads) > 0 {
+		payloads := make([]any, 0, len(m.Component.Payloads))
+		for _, payload := range m.Component.Payloads {
+			payloads = append(payloads, map[string]any{
+				"alias": payload.Alias, "name": payload.Name,
+				"version": payload.Version, "config": payload.Config,
+			})
+		}
+		component["payloads"] = payloads
+	}
 	doc["component"] = component
 	if m.Config != nil {
 		fields := make([]any, 0, len(m.Config))
@@ -234,6 +256,7 @@ func build(data map[string]any) *Manifest {
 			EventURL:    stringOr(component, "event_url", ""),
 			RPCURL:      stringOr(component, "rpc_url", ""),
 			TimeoutS:    intOr(component, "timeout_s"),
+			Payloads:    buildPayloads(component["payloads"]),
 		},
 		Reads:            stringList(data["reads"]),
 		Writes:           stringList(data["writes"]),
@@ -271,6 +294,22 @@ func buildService(raw map[string]any, topVersion string) *Service {
 		Description: stringOr(raw, "description", ""),
 		Version:     stringOr(raw, "version", topVersion),
 	}
+}
+
+// buildPayloads reads a validated payloads list into its four-member entries (rule 32).
+func buildPayloads(raw any) []Payload {
+	entries := listOf(raw)
+	payloads := make([]Payload, 0, len(entries))
+	for _, entry := range entries {
+		declared := mapOf(entry)
+		payloads = append(payloads, Payload{
+			Alias:   stringOr(declared, "alias", ""),
+			Name:    stringOr(declared, "name", ""),
+			Version: stringOr(declared, "version", ""),
+			Config:  stringOr(declared, "config", ""),
+		})
+	}
+	return payloads
 }
 
 // buildDiscovery reads a validated discovery block, applying the default category.

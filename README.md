@@ -14,7 +14,7 @@ platform itself is built on.
 | --- | --- |
 | `github.com/Clifford-Foster/slate-sdk-go/bbsdk` | The component SDK: activations, events, RPC, the loopback data plane, outbound invoke, watches. |
 | `github.com/Clifford-Foster/slate-sdk-go/bbsdk/harness` | The in-process test harness — run a component against an in-memory board, no sidecar and no fleet. |
-| `github.com/Clifford-Foster/slate-sdk-go/bbsdk/steps` | The steps runtime: bind a step document, run a chain, write results back. |
+| `github.com/Clifford-Foster/slate-sdk-go/bbsdk/components` | The component runtime: bind a chain document, run a chain, write results back. |
 | `github.com/Clifford-Foster/slate-sdk-go/blackboard` | The coordination library: the JetStream KV blackboard, the precondition DSL, agent activation, the capability registry. |
 | `github.com/Clifford-Foster/slate-sdk-go/manifest` | The component manifest parser and validator. |
 
@@ -38,11 +38,11 @@ implements:
 
 | Contract | Version | Covers |
 | --- | --- | --- |
-| `contracts/bb_sdk_go.md` | 0.8.1 | `bbsdk`, `bbsdk/harness` |
-| `contracts/steps_runtime.md` | 0.13.1 | `bbsdk/steps` |
-| `contracts/sidecar.md` | 0.25.1 | the component ↔ sidecar boundary `bbsdk` speaks |
-| `contracts/blackboard_platform.md` | 0.34.1 | `blackboard` |
-| `contracts/manifest.md` | 0.13.2 | `manifest` |
+| `contracts/bb_sdk_go.md` | 0.10.0 | `bbsdk`, `bbsdk/harness` |
+| `contracts/components_runtime.md` | 0.19.0 | `bbsdk/components` |
+| `contracts/sidecar.md` | 0.25.2 | the component ↔ sidecar boundary `bbsdk` speaks |
+| `contracts/blackboard_platform.md` | 0.34.3 | `blackboard` |
+| `contracts/manifest.md` | 0.14.0 | `manifest` |
 
 The `// Contract:` annotations throughout the source resolve against that upstream `contracts/`
 directory.

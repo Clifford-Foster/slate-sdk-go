@@ -7,7 +7,7 @@
 // This is not public API: it is the narrow equivalent of the repo's testexport.go convention
 // (.claude/rules/conventions.md), used by this SDK's own harness subpackage and by nothing else.
 
-package steps
+package components
 
 // HarnessRunner builds a runner whose retry backoff is not waited, for the rule-H18 chain driver.
 func HarnessRunner(b *Bound, board Board) *Runner {

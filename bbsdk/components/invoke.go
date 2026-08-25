@@ -1,6 +1,6 @@
-// Contract: contracts/sidecar.md — rules A28 to A30, the invoke a service-bound step executes as.
+// Contract: contracts/sidecar.md — rules A28 to A30, the invoke a service-bound component executes as.
 
-package steps
+package components
 
 import (
 	"context"
@@ -32,18 +32,18 @@ var invokeCauses = map[string]invokeCause{
 // fabricated transient.
 var invokeFallback = invokeCause{CauseInternal, false}
 
-// invokeStep executes a service-bound step as one invoke on the composite's own sidecar (rule 13):
+// invokeStep executes a service-bound component as one invoke on the composite's own sidecar (rule 13):
 // the input dict is the payload verbatim, the reply dict is the output verbatim.
-func invokeStep(ctx context.Context, entry *boundStep, input map[string]any) (map[string]any, *StepError) {
+func invokeStep(ctx context.Context, entry *boundComponent, input map[string]any) (map[string]any, *ComponentError) {
 	target, invoker := entry.spec.Service, entry.invoker
 	if target == nil || invoker == nil {
 		return nil, stepError(CauseInternal, false, nil,
-			"step %q is bound %q but the runner was given no invoke transport for it", entry.spec.Alias, bindingNATS)
+			"component %q is bound %q but the runner was given no invoke transport for it", entry.spec.Alias, communicationNATS)
 	}
 	options := []bbsdk.InvokeOption{}
 	if entry.spec.TimeoutS > 0 {
-		// The step's timeout_s is transmitted with the invoke and kept as the local budget; whichever
-		// expires first produces the identical timeout StepError.
+		// The component's timeout_s is transmitted with the invoke and kept as the local budget; whichever
+		// expires first produces the identical timeout ComponentError.
 		options = append(options, bbsdk.WithInvokeTimeout(time.Duration(entry.spec.TimeoutS)*time.Second))
 	}
 	reply, err := invoker.Invoke(ctx, target.Name, target.Endpoint, input, options...)
@@ -59,6 +59,6 @@ func invokeStep(ctx context.Context, entry *boundStep, input map[string]any) (ma
 		mapped = invokeFallback
 	}
 	return nil, stepError(mapped.cause, mapped.retryable, err,
-		"step %q invoke of %s.%s failed (%s): %s",
+		"component %q invoke of %s.%s failed (%s): %s",
 		entry.spec.Alias, target.Name, target.Endpoint, failure.Code, failure.Message)
 }
