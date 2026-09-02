@@ -22,9 +22,6 @@ type Writes map[string]map[string]any
 // ActivationFunc is the component's activation entry point, identical in both delivery modes (rule K1).
 type ActivationFunc func(ctx context.Context, a *Activation) (Writes, error)
 
-// EventFunc handles one fire-and-forget event (rule K12).
-type EventFunc func(ctx context.Context, e *Event) error
-
 // RPCFunc handles one bridged Micro request (rule K13).
 type RPCFunc func(ctx context.Context, r *RPCRequest) (map[string]any, error)
 
@@ -67,6 +64,22 @@ type dataPlane interface {
 
 var _ dataPlane = (*Client)(nil)
 
+// sourceKindBoard is the source kind every precondition-driven activation carries, and the value a
+// payload with no source member at all defaults to — a sidecar older than B36 (rule K21).
+const sourceKindBoard = "board"
+
+// ActivationSource is the ActivationPayload's source member: what produced this activation (rule K21).
+type ActivationSource struct {
+	// Kind is "board" on a precondition-driven activation and "subject" on a hardwired one.
+	Kind string `json:"kind"`
+	// Subject is the declared subscription the message arrived on, in the manifest's own spelling.
+	Subject string `json:"subject"`
+	// Durable is that subscription's declared delivery arm.
+	Durable bool `json:"durable"`
+	// Redelivered reports whether the broker re-delivered the message.
+	Redelivered bool `json:"redelivered"`
+}
+
 // Activation is one delivered activation: the payload fields, the data plane, and the mint and fail
 // affordances the boundary requires of a component (rules K1, K6 to K9).
 type Activation struct {
@@ -74,6 +87,12 @@ type Activation struct {
 	BlackboardID string
 	// ActivationID is the component's idempotency key, stable across redeliveries (rules K4, B3).
 	ActivationID string
+	// Source is this activation's source; Kind is "board" when the payload carries none (rule K21).
+	Source ActivationSource
+	// Input is the subject message body parsed as an object, nil on a board activation (rule K21).
+	Input map[string]any
+	// InputB64 is base64 of the raw message bytes, carried only when Input is null (rule K21).
+	InputB64 string
 	// Snapshot is every currently-set watched key's value at evaluation time.
 	Snapshot map[string]map[string]any
 	// ChangedKeys is the sorted, de-duplicated set of keys whose change produced this evaluation.
@@ -94,6 +113,21 @@ type activationPayload struct {
 	Snapshot     map[string]map[string]any `json:"snapshot"`
 	ChangedKeys  []string                  `json:"changed_keys"`
 	ActivationID string                    `json:"activation_id"`
+	// Source is a pointer so its absence stays distinguishable from a zero value: a payload carrying
+	// no source member at all is an older sidecar's, and defaults to the board kind (rule K21).
+	Source   *ActivationSource `json:"source"`
+	Input    map[string]any    `json:"input"`
+	InputB64 string            `json:"input_b64"`
+}
+
+// source reads the payload's source member, defaulting a payload that carries none to the board
+// kind with every other field zero — so a component written against rule K21 runs unchanged behind
+// a sidecar older than B36 and never branches on absence.
+func (p activationPayload) source() ActivationSource {
+	if p.Source == nil {
+		return ActivationSource{Kind: sourceKindBoard}
+	}
+	return *p.Source
 }
 
 // decodeActivation decodes an ActivationPayload, leaving the fields a body lacks at their zero
@@ -113,6 +147,9 @@ func newActivation(payload activationPayload, plane dataPlane, config map[string
 	return &Activation{
 		BlackboardID: payload.BlackboardID,
 		ActivationID: payload.ActivationID,
+		Source:       payload.source(),
+		Input:        payload.Input,
+		InputB64:     payload.InputB64,
 		Snapshot:     payload.Snapshot,
 		ChangedKeys:  payload.ChangedKeys,
 		Config:       config,
@@ -229,51 +266,10 @@ func (a *Activation) stamp(value map[string]any) (map[string]any, error) {
 	return blackboard.WithCorrelation(value, a.correlationID), nil
 }
 
-// Event is one delivered event, mirroring the sidecar's EventPayload (rule K12).
-type Event struct {
-	// Subject is the concrete NATS subject the message arrived on.
-	Subject string
-	// Payload is the body parsed as a JSON object, nil when the wire value is null.
-	Payload map[string]any
-	// PayloadB64 is base64 of the raw bytes, present only when Payload is nil.
-	PayloadB64 string
-	// Config is the parsed BB_CONFIG (rule C3).
-	Config map[string]any
-
-	dataPlane
-}
-
-// eventPayload is the EventPayload body the event webhook and the pull stream both carry
-// (sidecar.md rule B15).
-type eventPayload struct {
-	Subject    string         `json:"subject"`
-	Payload    map[string]any `json:"payload"`
-	PayloadB64 string         `json:"payload_b64"`
-}
-
-// decodeEvent decodes an EventPayload. The wire is mirrored exactly, the lossless non-JSON case
-// included: an event whose body is not an object arrives as a nil Payload plus PayloadB64
-// (sidecar.md rule B15).
-func decodeEvent(body []byte) eventPayload {
-	var payload eventPayload
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return eventPayload{}
-	}
-	return payload
-}
-
-// newEvent builds one event from a decoded payload, the component's data plane, and the
-// process-wide config. The push webhook and the pull stream build the same Event from the same
-// payload, so one handler serves a component in either delivery mode (rules K12, K15a).
-func newEvent(payload eventPayload, plane dataPlane, config map[string]any) *Event {
-	return &Event{
-		Subject:    payload.Subject,
-		Payload:    payload.Payload,
-		PayloadB64: payload.PayloadB64,
-		Config:     config,
-		dataPlane:  plane,
-	}
-}
+// The event-handler path is retired outright (rule K12, Clifford's D2 ruling, 2026-09-01): EventFunc,
+// Event and the EventPayload decode are gone with sidecar.md's event_url, EventPayload and rule B15,
+// and have no replacement API. A message on a declared subscribes subject is an ordinary rule-K1
+// activation whose Source.Kind is "subject" and whose Input is the message body (rule K21).
 
 // RPCRequest is one bridged Micro request (rule K13).
 type RPCRequest struct {

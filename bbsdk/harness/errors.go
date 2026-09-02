@@ -33,21 +33,24 @@ func reserved(key string) bool {
 	return key == "meta" || strings.HasPrefix(key, metaPrefix)
 }
 
-// writeAuthorized reports whether a key matches a declared writes pattern: a literal, or prefix.>
-// matching the prefix plus one or more further tokens (sidecar.md rule A8, reproduced by rule H7).
+// writeAuthorized reports whether a key matches any declared writes pattern (sidecar.md rule A8,
+// reproduced by rule H7).
 func writeAuthorized(key string, patterns []string) bool {
 	for _, pattern := range patterns {
-		if prefix, ok := strings.CutSuffix(pattern, ".>"); ok {
-			if strings.HasPrefix(key, prefix+".") {
-				return true
-			}
-			continue
-		}
-		if key == pattern {
+		if writeMatches(key, pattern) {
 			return true
 		}
 	}
 	return false
+}
+
+// writeMatches reports whether a key matches one writes pattern: a literal, or prefix.> matching the
+// prefix plus one or more further tokens.
+func writeMatches(key, pattern string) bool {
+	if prefix, ok := strings.CutSuffix(pattern, ".>"); ok {
+		return strings.HasPrefix(key, prefix+".")
+	}
+	return key == pattern
 }
 
 // matchesAny reports whether a key matches any of the read-grammar patterns.

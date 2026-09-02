@@ -23,11 +23,9 @@ const (
 	defaultJitterFraction = 0.2
 )
 
-// The two SSE frame names the pull stream carries; every other name is skipped (rules K15a, G8).
-const (
-	streamEventActivation = "activation"
-	streamEventEvent      = "event"
-)
+// streamEventActivation is the one SSE frame name the pull stream carries; every other name — the
+// retired event frame of an older sidecar included — is skipped (rules K15a, S10, G8).
+const streamEventActivation = "activation"
 
 // Backoff is the pull consumer's reconnect ladder; zero fields take rule K19's defaults.
 type Backoff struct {
@@ -187,60 +185,36 @@ type ActivationStream struct {
 	closeErr  error
 }
 
-// Frame is one delivered pull frame: exactly one of its members is non-nil (rule K15a).
-type Frame struct {
-	// Activation is the frame's activation, nil on an event frame.
-	Activation *Activation
-	// Event is the frame's event, nil on an activation frame.
-	Event *Event
-}
-
-// NextFrame returns the next frame of either kind, io.EOF when the stream ends cleanly (rule K15a).
-func (s *ActivationStream) NextFrame(ctx context.Context) (Frame, error) {
+// Next returns the next activation, io.EOF when the stream ends cleanly (rules K15, K15a). The
+// stream carries activations only: the retired event frame (rule K15a) reaching it from an older
+// sidecar is skipped exactly as any unknown frame name is, and is never acked.
+func (s *ActivationStream) Next(ctx context.Context) (*Activation, error) {
 	// A stream's lifetime is the context Activations opened it with — the connection is what a
 	// blocked read is waiting on — so this context is the caller's cancellation check, never a
 	// response deadline (rule S2). Its error is returned rather than swallowed (rule G2).
 	for {
 		if err := ctx.Err(); err != nil {
-			return Frame{}, err
+			return nil, err
 		}
 		frame, err := s.reader.next()
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return Frame{}, ctxErr
+				return nil, ctxErr
 			}
 			if errors.Is(err, io.EOF) {
-				return Frame{}, io.EOF
+				return nil, io.EOF
 			}
-			return Frame{}, fmt.Errorf("bbsdk: reading the activation stream: %w", err)
+			return nil, fmt.Errorf("bbsdk: reading the activation stream: %w", err)
 		}
-		switch frame.event {
-		case streamEventActivation:
-			// At most one activation is in flight, so this is not a queue: a redelivery after a
-			// reconnect arrives with its original id and reaches the handler again (rules B10, K20).
-			return Frame{Activation: newActivation(
-				decodeActivation([]byte(frame.data)), s.consumer.client, s.consumer.config)}, nil
-		case streamEventEvent:
-			// The stream's event frame is the same Event the push webhook dispatches, built from the
-			// same EventPayload, and it is never acked: there is nothing to complete (rules K12, K15a).
-			return Frame{Event: newEvent(
-				decodeEvent([]byte(frame.data)), s.consumer.client, s.consumer.config)}, nil
+		if frame.event != streamEventActivation {
+			// An unknown frame name is skipped without error: the SDK never fails a component
+			// because the sidecar grew — or, here, still carries — a frame (rules G8, S10, K15a).
+			continue
 		}
-		// An unknown frame name is skipped without error: the SDK never fails a component
-		// because the sidecar grew a frame (rules G8, S10).
-	}
-}
-
-// Next returns the next activation, event frames skipped, io.EOF at the stream's end (rules K15, K15a).
-func (s *ActivationStream) Next(ctx context.Context) (*Activation, error) {
-	for {
-		frame, err := s.NextFrame(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if frame.Activation != nil {
-			return frame.Activation, nil
-		}
+		// Under single_flight several subject activations may be in flight at once, so this is not a
+		// one-at-a-time queue; a redelivery after a reconnect arrives with its original id and reaches
+		// the handler again (rules B10, B39, K20).
+		return newActivation(decodeActivation([]byte(frame.data)), s.consumer.client, s.consumer.config), nil
 	}
 }
 
@@ -255,10 +229,9 @@ type pullOptions struct {
 	client  []Option
 	backoff Backoff
 	onError func(error)
-	onEvent EventFunc
 }
 
-// PullOption configures the RunPull loop (rules K15a, K16, K18, K19).
+// PullOption configures the RunPull loop (rules K16, K18, K19).
 type PullOption func(*pullOptions) error
 
 // WithClientOptions supplies the client options RunPull builds its consumer with (rules S1, K16).
@@ -285,13 +258,8 @@ func WithErrorHook(hook func(error)) PullOption {
 	}
 }
 
-// WithEventHandler gives the loop an event handler; with none installed event frames are dropped (rules K15a, K16).
-func WithEventHandler(h EventFunc) PullOption {
-	return func(o *pullOptions) error {
-		o.onEvent = h
-		return nil
-	}
-}
+// The event-handler option is retired with the event frame (rule K15a); an event frame from an older
+// sidecar is skipped by Next like any unknown name, and no ack is issued for it.
 
 // RunPull runs the whole pull loop — connect, dispatch, ack, reconnect — until ctx is done (rules K16 to K19).
 func RunPull(ctx context.Context, h ActivationFunc, opts ...PullOption) error {
@@ -315,7 +283,7 @@ func RunPull(ctx context.Context, h ActivationFunc, opts ...PullOption) error {
 	}()
 	attempt := 0
 	for ctx.Err() == nil {
-		delivered, err := consumer.pump(ctx, h, settings.onEvent, settings.onError)
+		delivered, err := consumer.pump(ctx, h, settings.onError)
 		if delivered {
 			// The ladder's counter resets on a delivered activation, never merely on a connection.
 			attempt = 0
@@ -336,8 +304,7 @@ func RunPull(ctx context.Context, h ActivationFunc, opts ...PullOption) error {
 
 // pump runs one stream connection to its end, reporting whether it delivered an activation — the
 // signal that resets the reconnect ladder (rule K19).
-func (p *PullConsumer) pump(
-	ctx context.Context, h ActivationFunc, onEvent EventFunc, onError func(error)) (bool, error) {
+func (p *PullConsumer) pump(ctx context.Context, h ActivationFunc, onError func(error)) (bool, error) {
 	stream, err := p.Activations(ctx)
 	if err != nil {
 		return false, err
@@ -349,27 +316,14 @@ func (p *PullConsumer) pump(
 	}()
 	delivered := false
 	for {
-		frame, err := stream.NextFrame(ctx)
+		activation, err := stream.Next(ctx)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return delivered, nil
 			}
 			return delivered, err
 		}
-		if frame.Event != nil {
-			// The event handler runs on this goroutine, before the next frame is read, so a slow one
-			// delays the next activation; with no handler installed the frame is dropped. Its error is
-			// reported through the error hook and nothing else: an event takes no ack, no trace record
-			// and no part in the activation lifecycle (rules K15a, K16).
-			if onEvent != nil {
-				if eventErr := onEvent(ctx, frame.Event); eventErr != nil {
-					report(onError, eventErr)
-				}
-			}
-			continue
-		}
-		activation := frame.Activation
-		// The ladder's counter resets on a delivered activation, and an event frame is not one (rule K19).
+		// The ladder's counter resets on a delivered activation (rule K19).
 		delivered = true
 		writes, handlerErr := h(ctx, activation)
 		if handlerErr != nil {

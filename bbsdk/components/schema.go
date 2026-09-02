@@ -12,6 +12,8 @@ import (
 	"strings"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
+
+	"github.com/Clifford-Foster/slate-sdk-go/manifest"
 )
 
 // seamSchemaScheme keeps a compiled seam schema's identity out of the filesystem's namespace: the
@@ -33,6 +35,14 @@ func (refusingLoader) Load(url string) (any, error) {
 func compileSeamSchema(schemas fs.FS, alias, path string) (*jsonschema.Schema, error) {
 	if path == "" {
 		return nil, nil
+	}
+	if strings.HasPrefix(path, manifest.DictionaryPrefix) {
+		// `components_runtime.md` rule 6 §Dictionary references: no runtime resolves a reference, so one
+		// reaching here means the chain was built without `bb compose vendor` — which materializes the
+		// document into the vendored tree. The refusal is a startup one, on the will-not-prepare ground.
+		return nil, seamSchemaError(alias, path, errors.New(
+			"it is an unresolved dictionary reference — a runtime resolves nothing; run `bb compose vendor`, "+
+				"which materializes the document into the vendored tree"))
 	}
 	if schemas == nil {
 		return nil, seamSchemaError(alias, path, errors.New("no schema tree was supplied"))

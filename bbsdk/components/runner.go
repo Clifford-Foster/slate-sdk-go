@@ -336,11 +336,6 @@ func (r *Runner) dispatch(
 				done <- outcome{err: recovered(alias, value)}
 			}
 		}()
-		if entry.communication == communicationNATS {
-			output, failure := invokeStep(callCtx, entry, input)
-			done <- outcome{output: output, err: failure}
-			return
-		}
 		output, err := entry.component.Run(callCtx, input)
 		if err != nil {
 			done <- outcome{err: normalize(alias, err)}

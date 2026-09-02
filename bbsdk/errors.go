@@ -21,6 +21,11 @@ var ErrRevisionConflict = fmt.Errorf("%w: revision conflict", ErrSidecar)
 // ErrValueInvalid reports a malformed request: a bad value, key, body, watch pattern, claim key, or size.
 var ErrValueInvalid = fmt.Errorf("%w: invalid value", ErrSidecar)
 
+// ErrSchemaViolation reports a write the boundary refused against the component's own declared write
+// schema, so drift between a component's code and its declared shape is caught at the component that
+// drifted (rules E2, E8).
+var ErrSchemaViolation = fmt.Errorf("%w: schema violation", ErrSidecar)
+
 // ErrBlackboardUnavailable reports the sidecar's upstream blackboard being unreachable.
 var ErrBlackboardUnavailable = fmt.Errorf("%w: blackboard unavailable", ErrSidecar)
 
@@ -31,10 +36,12 @@ var ErrInvoke = fmt.Errorf("%w: invoke failed", ErrSidecar)
 // It is a local lifecycle verdict, not a boundary answer, so it stands outside the ErrSidecar tree.
 var ErrActivationFailed = errors.New("bbsdk: the activation already failed")
 
-// The two codes the SDK reads rather than merely relays, and the code a body it cannot parse yields.
+// The codes the SDK reads or raises rather than merely relays, and the code a body it cannot parse
+// yields. SCHEMA_VIOLATION is raised locally by the harness's board-side gate (rule H20).
 const (
 	codeKeyNotFound        = "KEY_NOT_FOUND"
 	codeInvokeServiceError = "INVOKE_SERVICE_ERROR"
+	codeSchemaViolation    = "SCHEMA_VIOLATION"
 	codeUnknown            = "UNKNOWN"
 )
 
@@ -53,7 +60,21 @@ var errorClasses = map[string]error{
 	"WATCH_PATTERN_INVALID":  ErrValueInvalid,
 	"CLAIM_KEY_INVALID":      ErrValueInvalid,
 	"REQUEST_TOO_LARGE":      ErrValueInvalid,
+	codeSchemaViolation:      ErrSchemaViolation,
 	"BLACKBOARD_UNAVAILABLE": ErrBlackboardUnavailable,
+}
+
+// ValidationVerdict is one sidecar.md Validation Verdict: what judged a value, the declared pattern
+// it was attached to, the concrete key, and the members the value did not satisfy (rule E8).
+type ValidationVerdict struct {
+	// Source is what judged the value: write_schema, read_expectation, or a value grown later.
+	Source string `json:"source"`
+	// Pattern is the declared write_schemas/read_expectations key the schema is attached to.
+	Pattern string `json:"pattern"`
+	// Key is the concrete key whose value was judged.
+	Key string `json:"key"`
+	// Unsatisfied names the unsatisfied members, in the validator's deterministic order.
+	Unsatisfied []string `json:"unsatisfied"`
 }
 
 // SidecarError is the boundary's error envelope, parsed (rule E1).
@@ -68,6 +89,8 @@ type SidecarError struct {
 	Rule string
 	// Status is the HTTP status, or 0 for a verdict the SDK raised locally (rule E6).
 	Status int
+	// Validation carries the envelope's verdicts, empty except on SCHEMA_VIOLATION (rule E8).
+	Validation []ValidationVerdict
 	// invoke marks a failure from the invoke route, whose every code is the one class (rule E5).
 	invoke bool
 }
@@ -98,13 +121,15 @@ type errorEnvelope struct {
 		Message string `json:"message"`
 		Key     string `json:"key"`
 		Rule    string `json:"rule"`
+		// Validation is read raw so a malformed member costs the verdicts and nothing else (rule E8).
+		Validation json.RawMessage `json:"validation"`
 	} `json:"error"`
 }
 
 // parseError reads a non-2xx body as the error envelope; an absent, unparseable or differently
 // shaped body degrades to UNKNOWN with an empty message rather than a swallowed failure (rule E1).
 func parseError(status int, body []byte, invoke bool) *SidecarError {
-	failure := &SidecarError{Code: codeUnknown, Status: status, invoke: invoke}
+	failure := &SidecarError{Code: codeUnknown, Status: status, invoke: invoke, Validation: []ValidationVerdict{}}
 	var envelope errorEnvelope
 	if err := json.Unmarshal(body, &envelope); err != nil || envelope.Error.Code == "" {
 		return failure
@@ -113,7 +138,56 @@ func parseError(status int, body []byte, invoke bool) *SidecarError {
 	failure.Message = envelope.Error.Message
 	failure.Key = envelope.Error.Key
 	failure.Rule = envelope.Error.Rule
+	failure.Validation = parseVerdicts(envelope.Error.Validation)
 	return failure
+}
+
+// parseVerdicts reads error.validation defensively: a missing or malformed member — the list itself,
+// one entry of it, or one member of an entry — yields an empty slice or a zero value, never an error
+// of its own, so a component still sees the failure the envelope reports (rule E8).
+func parseVerdicts(raw json.RawMessage) []ValidationVerdict {
+	verdicts := []ValidationVerdict{}
+	if len(raw) == 0 {
+		return verdicts
+	}
+	var entries []map[string]any
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return verdicts
+	}
+	for _, entry := range entries {
+		verdict := ValidationVerdict{
+			Source:      text(entry["source"]),
+			Pattern:     text(entry["pattern"]),
+			Key:         text(entry["key"]),
+			Unsatisfied: texts(entry["unsatisfied"]),
+		}
+		verdicts = append(verdicts, verdict)
+	}
+	return verdicts
+}
+
+// text reads one string member, yielding empty for a member of any other type.
+func text(value any) string {
+	rendered, isText := value.(string)
+	if !isText {
+		return ""
+	}
+	return rendered
+}
+
+// texts reads one string list member, skipping entries that are not strings.
+func texts(value any) []string {
+	items, isList := value.([]any)
+	if !isList {
+		return []string{}
+	}
+	rendered := make([]string, 0, len(items))
+	for _, item := range items {
+		if member, isText := item.(string); isText {
+			rendered = append(rendered, member)
+		}
+	}
+	return rendered
 }
 
 // localInvokeError is the target-fault verdict the SDK raises itself; a zero Status is how a

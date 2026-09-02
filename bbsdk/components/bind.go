@@ -1,5 +1,3 @@
-// Contract: contracts/sidecar.md — rule A28, the invoke a service-bound component is dispatched through.
-
 package components
 
 import (
@@ -14,16 +12,6 @@ import (
 
 	bbsdk "github.com/Clifford-Foster/slate-sdk-go/bbsdk"
 )
-
-// Invoker is the rule-13 dispatch seam for a service-bound component; *bbsdk.Client satisfies it.
-type Invoker interface {
-	Invoke(
-		ctx context.Context,
-		service, endpoint string,
-		payload map[string]any,
-		opts ...bbsdk.InvokeOption,
-	) (map[string]any, error)
-}
 
 // Board is the boundary-IO seam the runner reads and writes its three keys through; *bbsdk.Client
 // satisfies it.
@@ -46,7 +34,6 @@ type boundComponent struct {
 	config        map[string]any
 	inputSchema   *jsonschema.Schema
 	outputSchema  *jsonschema.Schema
-	invoker       Invoker
 	// wired is the entry's bound components table in sorted slot order, which is the order rule 8's
 	// setup sweep visits them in — immediately after this entry's own.
 	wired []*boundComponent
@@ -60,13 +47,12 @@ func Bind(
 	providers map[string]Provider,
 	schemas fs.FS,
 	config map[string]any,
-	invoker Invoker,
 ) (*Bound, error) {
 	bound := &Bound{chain: c, stages: make([][]*boundComponent, 0, len(c.Stages))}
 	for _, stage := range c.Stages {
 		resolved := make([]*boundComponent, 0, len(stage.Components))
 		for _, spec := range stage.Components {
-			entry, err := bindOne(spec, providers, schemas, config, invoker)
+			entry, err := bindOne(spec, providers, schemas, config)
 			if err != nil {
 				return nil, err
 			}
@@ -115,7 +101,6 @@ func bindOne(
 	providers map[string]Provider,
 	schemas fs.FS,
 	config map[string]any,
-	invoker Invoker,
 ) (*boundComponent, error) {
 	communication, err := resolveCommunication(spec, config)
 	if err != nil {
@@ -135,13 +120,6 @@ func bindOne(
 		inputSchema:   inputSchema,
 		outputSchema:  outputSchema,
 	}
-	if communication == communicationNATS {
-		// Rule 13: the local object is never constructed — no Setup, no Teardown — and the component's own
-		// config fields are not transmitted; the remote component owns its lifecycle and its config.
-		entry.config = map[string]any{}
-		entry.invoker = invoker
-		return entry, nil
-	}
 	provider, declared := providers[spec.Alias]
 	if !declared || provider == nil {
 		return nil, fmt.Errorf("bbsdk/components: component %q is bound %q but no provider was supplied for it",
@@ -155,28 +133,27 @@ func bindOne(
 	}
 	entry.component = object
 	entry.config = componentConfig(spec, config)
-	if err := bindWiring(entry, providers, schemas, config, invoker); err != nil {
+	if err := bindWiring(entry, providers, schemas, config); err != nil {
 		return nil, err
 	}
 	return entry, nil
 }
 
 // bindWiring resolves the entry's components table exactly as a stage entry is resolved — its own
-// communication against its own legal set, its memory object from providers once per alias, its nats
-// dispatch to the invoker with no local object — and then hands the calling component's ComponentUser half
-// a Components over that result, once, before any traversal (rule T7).
+// communication against its own legal set and its memory object from providers once per alias, a
+// nats value refused under the same sentinel — and then hands the calling component's ComponentUser
+// half a Components over that result, once, before any traversal (rule T7).
 func bindWiring(
 	entry *boundComponent,
 	providers map[string]Provider,
 	schemas fs.FS,
 	config map[string]any,
-	invoker Invoker,
 ) error {
 	wiring := make(map[string]*boundComponent, len(entry.spec.Calls))
 	for _, slot := range slices.Sorted(maps.Keys(entry.spec.Calls)) {
 		// The nesting is one level: a wired entry carries no components of its own (rule 14), so this
 		// resolution recurses no further than compose's document can.
-		wired, err := bindOne(entry.spec.Calls[slot], providers, schemas, config, invoker)
+		wired, err := bindOne(entry.spec.Calls[slot], providers, schemas, config)
 		if err != nil {
 			return err
 		}
@@ -217,6 +194,12 @@ func resolveCommunication(spec ComponentSpec, config map[string]any) (string, er
 	// and a post-flip config bind against each other in either direction. Nothing is rewritten: the
 	// document keeps the spelling it was read with.
 	communication := foldCommunication(declared)
+	if communication == communicationNATS {
+		// Rule 18: refused, never rebound to memory — a component authored to run remotely and one
+		// embedded in the caller's process are two bodies of code that may differ. This precedes the
+		// membership test, so the verdict is the retirement and never ErrCommunicationUnsupported.
+		return "", fmt.Errorf("%w: component %q resolved to %q", ErrChainCommunicationRetired, spec.Alias, declared)
+	}
 	legal := foldLegalCommunications(spec.LegalCommunications)
 	if !slices.Contains(legal, communication) {
 		return "", fmt.Errorf("%w: component %q resolved to %q, and its legal set is [%s]",

@@ -32,7 +32,6 @@ type slotTotals struct {
 	calls     int
 	errors    int
 	duration  time.Duration
-	target    string
 	abandoned bool
 }
 
@@ -129,7 +128,7 @@ func (d *dispatcher) admit(slot string) (*boundComponent, *ComponentError) {
 			codeComponentCallLimit, d.alias, d.maxCalls)
 	}
 	d.calls++
-	d.slotTotals(slot, wired).calls++
+	d.slotTotals(slot).calls++
 	return wired, nil
 }
 
@@ -224,11 +223,6 @@ func (d *dispatcher) dispatch(
 				done <- outcome{err: recovered(wired.spec.Alias, value)}
 			}
 		}()
-		if wired.communication == communicationNATS {
-			output, failure := invokeStep(callCtx, wired, payload)
-			done <- outcome{output: output, err: failure}
-			return
-		}
 		output, err := wired.component.Run(callCtx, payload)
 		if err != nil {
 			done <- outcome{err: normalize(wired.spec.Alias, err)}
@@ -315,9 +309,6 @@ func (d *dispatcher) fold() map[string]any {
 			"errors": totals.errors,
 			"ms":     int(totals.duration.Milliseconds()),
 		}
-		if totals.target != "" {
-			member["target"] = totals.target
-		}
 		if totals.abandoned {
 			member["abandoned"] = true
 		}
@@ -352,15 +343,13 @@ func (d *dispatcher) markAbandoned(slot string) {
 	}
 }
 
-// slotTotals is the slot's aggregate member, minted on its first call. The caller holds the lock.
-func (d *dispatcher) slotTotals(slot string, wired *boundComponent) *slotTotals {
+// slotTotals is the slot's aggregate member, minted on its first call. The caller holds the lock. No
+// `target` member is ever written at this version (§Status key): the nats-bound slot that carried one
+// is retired (rule 18), and a reader tolerates one only on a record written before the flip.
+func (d *dispatcher) slotTotals(slot string) *slotTotals {
 	totals, present := d.totals[slot]
 	if !present {
 		totals = &slotTotals{}
-		if wired.communication == communicationNATS && wired.spec.Service != nil {
-			// The target records which service was called, never which build answered it (rule 15).
-			totals.target = wired.spec.Service.Name + "." + wired.spec.Service.Endpoint
-		}
 		d.totals[slot] = totals
 	}
 	return totals

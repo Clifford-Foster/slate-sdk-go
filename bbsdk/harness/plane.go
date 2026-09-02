@@ -29,8 +29,9 @@ type plane struct {
 	// recording is set for an activation, whose writes land on its Record (rule H8).
 	recording bool
 
-	mu     sync.Mutex
-	writes []Write
+	mu        sync.Mutex
+	writes    []Write
+	publishes []Publish
 }
 
 // Get reads one key, returning (nil, nil) when it is absent (rule S3).
@@ -50,9 +51,17 @@ func (p *plane) Keys(ctx context.Context) ([]string, error) {
 	return p.harness.board.Keys(ctx)
 }
 
-// Put writes a declared key unconditionally, carrying the activation's effective id (rules H7, H8).
+// Put writes a declared key unconditionally, carrying the activation's effective id (rules H7, H8)
+// — or, under communication: nats, publishes on it and answers rule S4's zero, because a writes
+// pattern is a publication scope there and nothing is ever put on the board (rule H21).
 func (p *plane) Put(ctx context.Context, key string, value map[string]any) (uint64, error) {
+	if p.harness.publishing() {
+		return 0, p.publishOutbound(key, value)
+	}
 	if err := p.authorize(key); err != nil {
+		return 0, err
+	}
+	if err := p.validate(key, value); err != nil {
 		return 0, err
 	}
 	stamped := stampCorrelation(value, p.inherited)
@@ -64,9 +73,19 @@ func (p *plane) Put(ctx context.Context, key string, value map[string]any) (uint
 	return revision, nil
 }
 
-// PutCAS writes a declared key only while it stands at revision (rules H7, H8).
+// PutCAS writes a declared key only while it stands at revision (rules H7, H8). Under nats a CAS has
+// no meaning on a publication, so it is the core library's ErrInvalidValue — the harness's analog of
+// the sidecar's 422 BODY_INVALID (rule H21).
 func (p *plane) PutCAS(ctx context.Context, key string, value map[string]any, revision uint64) (uint64, error) {
+	if p.harness.publishing() {
+		return 0, fmt.Errorf(
+			"%w: a compare-and-swap put has no meaning on a publication — the manifest declares communication: nats",
+			blackboard.ErrInvalidValue)
+	}
 	if err := p.authorize(key); err != nil {
+		return 0, err
+	}
+	if err := p.validate(key, value); err != nil {
 		return 0, err
 	}
 	stamped := stampCorrelation(value, p.inherited)
@@ -78,8 +97,13 @@ func (p *plane) PutCAS(ctx context.Context, key string, value map[string]any, re
 	return written, nil
 }
 
-// Delete removes a declared key unconditionally (rules H7, H8).
+// Delete removes a declared key unconditionally (rules H7, H8). Under nats there is no key to delete
+// and nothing to publish, so every delete is ErrUndeclaredWrite — the harness's analog of the
+// sidecar's 403 WRITE_NOT_AUTHORIZED (rule H21).
 func (p *plane) Delete(_ context.Context, key string) error {
+	if err := p.deletable(key); err != nil {
+		return err
+	}
 	if err := p.authorize(key); err != nil {
 		return err
 	}
@@ -87,8 +111,11 @@ func (p *plane) Delete(_ context.Context, key string) error {
 	return nil
 }
 
-// DeleteCAS removes a declared key only while it stands at revision (rules H7, H8).
+// DeleteCAS removes a declared key only while it stands at revision (rules H7, H8, H21).
 func (p *plane) DeleteCAS(_ context.Context, key string, revision uint64) error {
+	if err := p.deletable(key); err != nil {
+		return err
+	}
 	if err := p.authorize(key); err != nil {
 		return err
 	}
@@ -192,6 +219,33 @@ func (p *plane) acquire(ctx context.Context, key string, lease map[string]any, r
 	return true, nil
 }
 
+// publishOutbound routes a data-plane put under nats: a name matching a writes pattern or equal to a
+// declared publishes subject lands on Published() and the record, never on the board; a name
+// matching neither is ErrUndeclaredWrite, the analog of the sidecar's 403 (rules H21, S4).
+func (p *plane) publishOutbound(name string, value map[string]any) error {
+	if reserved(name) {
+		return fmt.Errorf("%w: %q is in the platform-reserved meta.* key space", ErrUndeclaredWrite, name)
+	}
+	if !p.harness.publishable(name) {
+		return fmt.Errorf("%w: %q matches no writes pattern and no publishes subject", ErrUndeclaredWrite, name)
+	}
+	if verdicts := p.harness.outboundVerdicts(name, value); len(verdicts) > 0 {
+		return schemaViolation(fmt.Sprintf("the publish on %q", name), verdicts)
+	}
+	p.publish(Publish{Subject: name, Payload: stampCorrelation(value, p.inherited)})
+	return nil
+}
+
+// deletable refuses every delete under nats: a publication has nothing to remove (rule H21).
+func (p *plane) deletable(key string) error {
+	if p.harness.publishing() {
+		return fmt.Errorf(
+			"%w: %q cannot be deleted — the manifest declares communication: nats, where there is no key to delete and nothing to publish",
+			ErrUndeclaredWrite, key)
+	}
+	return nil
+}
+
 // authorize applies the write half of the data plane: meta.* is blocked unconditionally and every
 // other key must match a declared writes pattern (rule H7).
 func (p *plane) authorize(key string) error {
@@ -202,6 +256,17 @@ func (p *plane) authorize(key string) error {
 		return fmt.Errorf("%w: %q matches no writes pattern", ErrUndeclaredWrite, key)
 	}
 	return nil
+}
+
+// validate applies the writer's own declared shapes to one context write: enforced per call, so a
+// violation returns immediately and earlier successful writes are kept, exactly as behind the
+// sidecar. A delete reaches this nowhere — a tombstone has no value to judge (rule H20).
+func (p *plane) validate(key string, value map[string]any) error {
+	verdicts := p.harness.shapes.writeVerdicts(key, value)
+	if len(verdicts) == 0 {
+		return nil
+	}
+	return schemaViolation(fmt.Sprintf("the write to %q", key), verdicts)
 }
 
 // claimable reports the claim namespace check: a foreign claim key is refused as a write would be (rule H12).
@@ -227,6 +292,29 @@ func (p *plane) applied() []Write {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return slices.Clone(p.writes)
+}
+
+// publish records one message the component published: on this activation's record where it has one,
+// and always on the harness's own publish log, which is where it stops (rule H21).
+func (p *plane) publish(message Publish) {
+	if p.recording {
+		p.mu.Lock()
+		p.publishes = append(p.publishes, message)
+		p.mu.Unlock()
+	}
+	p.harness.recordPublished(
+		Published{Subject: message.Subject, Payload: message.Payload, ActivationID: p.holder})
+}
+
+// published returns the messages this delivery published, in order; empty rather than nil, so a
+// record's Publishes reads the same whether or not the activation published anything.
+func (p *plane) published() []Publish {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.publishes) == 0 {
+		return []Publish{}
+	}
+	return slices.Clone(p.publishes)
 }
 
 // stampCorrelation returns the value carrying the effective correlation id, unless it already

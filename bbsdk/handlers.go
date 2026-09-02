@@ -1,5 +1,5 @@
-// Contract: contracts/sidecar.md — Part B rules B9, B15 and B16, the three webhooks a push
-// component serves.
+// Contract: contracts/sidecar.md — Part B rules B9 and B16, the two webhooks a push component
+// serves; the event webhook is retired with rule B15 (bb_sdk_go.md rule K12).
 
 package bbsdk
 
@@ -59,33 +59,8 @@ func ActivateHandler(c *Client, h ActivationFunc) http.Handler {
 	})
 }
 
-// EventHandler serves the event webhook at the manifest's event_url path (rule K12).
-func EventHandler(c *Client, h EventFunc) http.Handler {
-	config, configErr := ComponentConfig()
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "bbsdk: the event webhook accepts POST", http.StatusMethodNotAllowed)
-			return
-		}
-		if configErr != nil {
-			http.Error(w, "bbsdk: BB_CONFIG is not valid JSON", http.StatusInternalServerError)
-			return
-		}
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "bbsdk: the event body could not be read", http.StatusInternalServerError)
-			return
-		}
-		event := newEvent(decodeEvent(body), c, config)
-		if err := h(r.Context(), event); err != nil {
-			http.Error(w, "bbsdk: the event handler failed", http.StatusInternalServerError)
-			return
-		}
-		// Events are fire-and-forget and guard-free: no result envelope, no ack, and the sidecar
-		// ignores the body either way.
-		w.WriteHeader(http.StatusNoContent)
-	})
-}
+// The event webhook is retired with sidecar.md rule B15 and has no replacement (rule K12): a message
+// on a declared subscribes subject reaches ActivateHandler as an ordinary activation (rule K21).
 
 // RPCHandler serves the bridged Micro endpoints under the manifest's rpc_url mount point (rule K13).
 func RPCHandler(c *Client, handlers map[string]RPCFunc) http.Handler {

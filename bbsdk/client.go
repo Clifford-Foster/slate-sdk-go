@@ -65,17 +65,23 @@ func (c *Client) Get(ctx context.Context, key string) (*Entry, error) {
 	return &Entry{Key: payload.Key, Value: payload.Value, Revision: payload.Revision}, nil
 }
 
-// Put writes a value unconditionally and returns the new revision (rule S4).
+// Put writes a value unconditionally and returns the new revision — or 0 when the sidecar published
+// it instead of writing it, under a manifest declaring communication: nats (rule S4).
 func (c *Client) Put(ctx context.Context, key string, value map[string]any) (uint64, error) {
 	return c.put(ctx, key, map[string]any{"value": value})
 }
 
 // PutCAS writes a value only while the key stands at revision, returning the new revision (rule S4).
+// Under communication: nats the sidecar answers 422 BODY_INVALID — a CAS has no meaning on a
+// publication — which reaches the caller as the rule-E2 ErrValueInvalid class like any other.
 func (c *Client) PutCAS(ctx context.Context, key string, value map[string]any, revision uint64) (uint64, error) {
 	return c.put(ctx, key, map[string]any{"value": value, "revision": revision})
 }
 
-// put sends one PUT body and reads the new revision off the 200 response.
+// put sends one PUT body and reads the new revision off the 200 response. Under communication: nats
+// the sidecar publishes instead of writing and answers `{"published": "<key>"}` with no revision at
+// all, so the decode leaves the revision at 0 and that zero reaches the caller as rule S4's signal
+// that nothing was written to the board — a JetStream revision is never 0.
 func (c *Client) put(ctx context.Context, key string, body map[string]any) (uint64, error) {
 	encoded, err := encodeBody(body)
 	if err != nil {
@@ -97,7 +103,9 @@ func (c *Client) put(ctx context.Context, key string, body map[string]any) (uint
 	return payload.Revision, nil
 }
 
-// Delete removes a key unconditionally; deleting a missing key is a no-op (rule S5).
+// Delete removes a key unconditionally; deleting a missing key is a no-op (rule S5). Under
+// communication: nats every delete is the sidecar's 403 WRITE_NOT_AUTHORIZED — there is no key to
+// delete and nothing to publish — reaching the caller as ErrWriteNotAuthorized (rules S5, E2).
 func (c *Client) Delete(ctx context.Context, key string) error {
 	// An unconditional delete sends no body at all — the CAS form is the only one that carries one.
 	return c.delete(ctx, key, nil)

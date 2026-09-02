@@ -2,7 +2,8 @@ package manifest
 
 import "fmt"
 
-// Severities a finding carries; PRECONDITION_UNWATCHED_KEY is the only warning-severity code (rule 10).
+// Severities a finding carries; PRECONDITION_UNWATCHED_KEY, PRECONDITION_INERT and CONSUMES_INERT
+// are the only warning-severity codes (rules 10, 37).
 const (
 	SeverityError   = "error"
 	SeverityWarning = "warning"

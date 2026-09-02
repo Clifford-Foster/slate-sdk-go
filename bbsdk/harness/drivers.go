@@ -43,10 +43,6 @@ const (
 // test_harness.md rule 38).
 const communicationMemory = "memory"
 
-// communicationNATS is what an entry memory is not legal for is pinned to, dispatched to a registered
-// in-process responder rather than to transport (rule H18).
-const communicationNATS = "nats"
-
 // communicationAliasMemory is `memory`'s permanent parse alias, folded on read and never written.
 const communicationAliasMemory = "embedded"
 
@@ -78,22 +74,35 @@ type ComponentOptions struct {
 	Components map[string]func(ctx context.Context, payload map[string]any) (map[string]any, error)
 }
 
-// ChainOptions configures RunChain: the instance config, and the tree the seam schemas live in.
+// ChainOptions configures RunChain: the instance config, the tree the seam schemas live in, and — for
+// a hardwired composite — the subject the input arrives on beside that composite's own declarations.
+// Chains are memory-only (components_runtime.md rules 10, 18), so there is no responder field: the
+// driver substitutes nothing for a retired transport.
 type ChainOptions struct {
 	// Config is the instance config; its rule-10 communication fields are ignored, the rest reaches the components.
 	Config map[string]any
 	// Schemas is the tree the document's declared seam-schema paths resolve against.
 	Schemas fs.FS
-	// Responders answer an entry memory is not legal for, keyed by service then endpoint exactly as
-	// Options.InvokeResponders is. A registered in-process responder is not transport (rule H18).
-	Responders map[string]map[string]InvokeFunc
+	// Subject names the composite's declared subscribes subject the input arrives on, which makes the
+	// traversal a SUBJECT activation of a hardwired composite (rule H21, components_runtime.md rule 19):
+	// the input is the message body and becomes stage 1's input exactly as input_key's value would, and
+	// the document's input_key is not read. Empty leaves RunChain rule H18's board arm unchanged.
+	Subject string
+	// Subscribes and Publishes are the composite's own declared subject members, which live in its
+	// bb.toml and never in the chain document (rule 19 derives nothing from them). Subject must match
+	// one of Subscribes, and a successful subject traversal lands the output on Publishes' one entry.
+	Subscribes []string
+	Publishes  []string
 }
 
-// ChainRecord is one in-memory traversal: its output, every status write in the writer's order, and
-// the terminal failure.
+// ChainRecord is one in-memory traversal: its output, what it published, every status write in the
+// writer's order, and the terminal failure.
 type ChainRecord struct {
 	// Output is the chain's final dict, nil when the traversal failed.
 	Output map[string]any
+	// Publishes carries the final output under the composite's one declared publishes subject on a
+	// successful subject traversal, and is empty otherwise (rule H21).
+	Publishes []Publish
 	// Statuses is every status write, in the order the single writer performed it.
 	Statuses []map[string]any
 	// Err is the terminal ComponentError, nil when the traversal succeeded.
@@ -132,7 +141,7 @@ func RunComponent(ctx context.Context, component components.Component, input map
 	}
 	providers := map[string]components.Provider{stepAlias: func() components.Component { return component }}
 	board := newChainBoard(chain.StatusKey, chain.InputKey, input)
-	bound, err := components.Bind(chain, providers, schemas, nil, nil)
+	bound, err := components.Bind(chain, providers, schemas, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +162,8 @@ func RunComponent(ctx context.Context, component components.Component, input map
 	return board.value(chain.OutputKey), nil
 }
 
-// RunChain drives a whole chain document in memory, communication every component memory (rule H18).
+// RunChain drives a whole chain document in memory, binding every component memory (rule H18), and
+// with ChainOptions.Subject set drives it as a subject activation of a hardwired composite (rule H21).
 func RunChain(
 	ctx context.Context,
 	document []byte,
@@ -165,6 +175,13 @@ func RunChain(
 	if err != nil {
 		return ChainRecord{}, err
 	}
+	if opts.Subject != "" && !slices.Contains(opts.Subscribes, opts.Subject) {
+		// Rule H21: before any traversal — the rule-18 startup shape. The sidecar would never have
+		// subscribed a subject the composite does not declare.
+		return ChainRecord{}, fmt.Errorf(
+			"%w: the subject %q is not one of this composite's declared subscribes subjects %v",
+			ErrHarnessState, opts.Subject, opts.Subscribes)
+	}
 	config := maps.Clone(opts.Config)
 	if config == nil {
 		config = map[string]any{}
@@ -174,8 +191,11 @@ func RunChain(
 			pinBinding(spec, config)
 		}
 	}
+	// On the subject arm the input is the message body and becomes stage 1's input exactly as
+	// input_key's value would — which is what seeding it at input_key achieves here, the document's
+	// own input_key never being read by the caller (rule H21).
 	board := newChainBoard(chain.StatusKey, chain.InputKey, input)
-	bound, err := components.Bind(chain, providers, opts.Schemas, config, responderInvoker{responders: opts.Responders})
+	bound, err := components.Bind(chain, providers, opts.Schemas, config)
 	if err != nil {
 		return ChainRecord{}, err
 	}
@@ -197,19 +217,25 @@ func RunChain(
 		return record, nil
 	}
 	record.Output = board.value(chain.OutputKey)
+	if opts.Subject != "" {
+		// Exactly one entry when the composite declares publishes, none when it does not; output_key is
+		// unaffected by this driver either way (rule H21).
+		for _, subject := range opts.Publishes {
+			record.Publishes = append(record.Publishes, Publish{Subject: subject, Payload: record.Output})
+		}
+	}
 	return record, nil
 }
 
-// pinBinding pins one entry's communication, and every entry its wiring carries: memory wherever memory is
-// legal for it, and otherwise the nats dispatch to a registered responder. The rule-5 embed gate is
-// enforced from the document — the driver never binds an entry memory against a legal set that
-// excludes it, so gate soundness survives the pin's move (rule H18).
+// pinBinding pins one entry's communication, and every entry its wiring carries: memory wherever
+// memory is legal for it. The rule-5 embed gate is enforced from the document — the driver never
+// binds an entry memory against a legal set that excludes it, so gate soundness survives the pin's
+// move — and an entry memory is NOT legal for is left at the document's own value, which Bind then
+// refuses (rules 10, 18; rule H18).
 func pinBinding(spec components.ComponentSpec, config map[string]any) {
-	communication := communicationNATS
 	if memoryBindable(spec.LegalCommunications) {
-		communication = communicationMemory
+		config["component_"+spec.Alias+"_communication"] = communicationMemory
 	}
-	config["component_"+spec.Alias+"_communication"] = communication
 	for _, wired := range spec.Calls {
 		// A wired component is pinned on the same terms as a stage entry; without it a chain wiring an
 		// existing deployed component could not be driven here at all.
@@ -234,37 +260,6 @@ func (c componentFakes) Call(ctx context.Context, slot string, payload map[strin
 		}
 	}
 	return responder(ctx, payload)
-}
-
-// responderInvoker dispatches a nats-bound entry to a registered in-process responder (rule H18).
-type responderInvoker struct {
-	responders map[string]map[string]InvokeFunc
-}
-
-// Invoke answers from the registry; an unanswered target is INVOKE_NO_RESPONDERS on rule H14's terms,
-// which is what proves the registry live rather than the entry having been bound memory behind the
-// assertion's back.
-func (r responderInvoker) Invoke(
-	ctx context.Context,
-	service, endpoint string,
-	payload map[string]any,
-	_ ...bbsdk.InvokeOption,
-) (map[string]any, error) {
-	target := service + "." + endpoint
-	responder := r.responders[service][endpoint]
-	if responder == nil {
-		return nil, bbsdk.HarnessInvokeError(codeInvokeNoResponders,
-			fmt.Sprintf("no responder is registered for %q", target))
-	}
-	reply, err := responder(ctx, payload)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w",
-			bbsdk.HarnessInvokeError(codeInvokeServiceError, fmt.Sprintf("the %q responder failed", target)), err)
-	}
-	if reply == nil {
-		return map[string]any{}, nil
-	}
-	return reply, nil
 }
 
 // resolvedStepConfig applies rule H17's merge by presence: the declared defaults are laid down first

@@ -8,7 +8,7 @@ import (
 
 // documentVersion is the canonical-chain-document version compose emits and this runtime reads
 // (components_runtime.md §Logical, rule T5).
-const documentVersion = 3
+const documentVersion = 4
 
 // legacyDocumentVersion is the pre-unification version, accepted on read PERMANENTLY: it carries this
 // document's members under their old spellings and is read as exactly this document with those five
@@ -17,14 +17,15 @@ const documentVersion = 3
 // rebuilt but a document a later compose wrote must not be run wiring-less.
 const legacyDocumentVersion = 2
 
+// retiredCommunicationDocumentVersion is the version whose entries may carry a `service` member and a
+// `nats` member of their legal set. Both are tolerated by the decode — never typed, never validated —
+// and what they mean for binding is rule T7's: an entry that RESOLVES to `nats` is refused there
+// under components_runtime.md rule 18, and one that resolves to `memory` binds with its `service`
+// member read and ignored.
+const retiredCommunicationDocumentVersion = 3
+
 // chainDocumentPath is where compose puts the document inside the embedded components tree (rule 11a).
 const chainDocumentPath = "components/chain.json"
-
-// ServiceTarget is a service-bound component's remote target: a deployed component and one of its endpoints.
-type ServiceTarget struct {
-	Name     string `json:"name"`
-	Endpoint string `json:"endpoint"`
-}
 
 // ComponentSpec is one chain entry exactly as compose derived it; the runtime re-derives none of it.
 type ComponentSpec struct {
@@ -38,7 +39,6 @@ type ComponentSpec struct {
 	Config              map[string]any `json:"config"`
 	Retries             int            `json:"retries"`
 	TimeoutS            int            `json:"timeout_s"`
-	Service             *ServiceTarget `json:"service"`
 	InputSchema         string         `json:"input_schema"`
 	OutputSchema        string         `json:"output_schema"`
 	// Calls is the entry's wiring table, keyed by slot and one level deep; MaxComponentCalls is
@@ -124,7 +124,7 @@ func ParseChain(data []byte) (Chain, error) {
 		return Chain{}, fmt.Errorf("%w: %w", ErrChainDocumentInvalid, err)
 	}
 	switch probe.Meta.DocumentVersion {
-	case documentVersion:
+	case documentVersion, retiredCommunicationDocumentVersion:
 		var decoded document
 		if err := json.Unmarshal(data, &decoded); err != nil {
 			return Chain{}, fmt.Errorf("%w: %w", ErrChainDocumentInvalid, err)
@@ -147,8 +147,9 @@ func ParseChain(data []byte) (Chain, error) {
 		return chain, nil
 	default:
 		// The compatibility gate: a runtime that does not know the value refuses to start.
-		return Chain{}, fmt.Errorf("%w: document_version %d is neither %d nor %d",
-			ErrChainDocumentInvalid, probe.Meta.DocumentVersion, documentVersion, legacyDocumentVersion)
+		return Chain{}, fmt.Errorf("%w: document_version %d is none of %d, %d, %d",
+			ErrChainDocumentInvalid, probe.Meta.DocumentVersion,
+			documentVersion, retiredCommunicationDocumentVersion, legacyDocumentVersion)
 	}
 }
 

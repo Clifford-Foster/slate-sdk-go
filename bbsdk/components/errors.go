@@ -14,6 +14,14 @@ var ErrChainInputMissing = errors.New("bbsdk/components: the chain input key is 
 // ErrCommunicationUnsupported reports a resolved communication outside the entry's legal set — COMPONENT_COMMUNICATION_UNSUPPORTED (rule T7).
 var ErrCommunicationUnsupported = errors.New("bbsdk/components: the resolved communication is not legal for this component")
 
+// ErrChainCommunicationRetired reports an entry that resolves to nats — CHAIN_COMMUNICATION_RETIRED
+// (components_runtime.md rule 18, rule T7). A chain never binds nats: the target is a hardwired peer
+// declaring serves, invoked from inside the calling component's own Run under its own invokes.
+var ErrChainCommunicationRetired = errors.New(
+	"bbsdk/components: a chain entry never binds 'nats' — declare the target as a hardwired peer with " +
+		"'serves' and invoke it from inside the calling component's own Run(), naming it in that " +
+		"component's bb.toml 'invokes'")
+
 // ErrSeamSchemaInvalid reports a declared seam schema that will not compile (rule T12).
 var ErrSeamSchemaInvalid = errors.New("bbsdk/components: the declared seam schema will not compile")
 

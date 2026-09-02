@@ -14,11 +14,18 @@ import (
 
 // Field defaults the loaded model applies.
 const (
-	defaultCategory     = "agent"
-	deliveryPush        = "push"
-	deliveryPull        = "pull"
-	activationBroadcast = "broadcast"
+	defaultCategory         = "agent"
+	deliveryPush            = "push"
+	deliveryPull            = "pull"
+	activationBroadcast     = "broadcast"
+	communicationBlackboard = "blackboard"
+	communicationNATS       = "nats"
+	subscriptionBroadcast   = "broadcast"
+	subscriptionQueue       = "queue"
 )
+
+// reservedSubjectPrefix is the platform's broker prefix, never user-space (rules 34, 37).
+const reservedSubjectPrefix = "bb"
 
 var (
 	nameRE             = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,63}$`)
@@ -35,23 +42,28 @@ var (
 )
 
 var (
-	categories    = set("agent", "tool", "provider", "persistence", "core", "infrastructure", "integration", "utility")
-	deliveries    = set(deliveryPush, deliveryPull)
-	activations   = set("exclusive", activationBroadcast)
-	configTypes   = set("string", "number", "boolean", "enum")
-	reservedPorts = set("8722", "8723")
+	categories        = set("agent", "tool", "provider", "persistence", "core", "infrastructure", "integration", "utility")
+	deliveries        = set(deliveryPush, deliveryPull)
+	activations       = set("exclusive", activationBroadcast)
+	communications    = set(communicationBlackboard, communicationNATS)
+	subscriptionModes = set(subscriptionBroadcast, subscriptionQueue)
+	configTypes       = set("string", "number", "boolean", "enum")
+	reservedPorts     = set("8722", "8723")
 )
 
 var (
-	topFields         = set("name", "version", "description", "reads", "writes", "consumes", "precondition", "activation", "arbitration_group", "events", "service", "invokes", "discovery", "component", "config")
-	serviceFields     = set("description", "version", "endpoints")
-	endpointFields    = set("name", "subject", "description")
+	topFields         = set("name", "version", "description", "communication", "reads", "writes", "consumes", "precondition", "activation", "arbitration_group", "subscribes", "publishes", "serves", "single_flight", "invokes", "discovery", "component", "config", "write_schemas", "read_expectations")
+	subscribesFields  = set("subject", "durable", "mode", "strict", "schema")
+	publishesFields   = set("subject", "schema")
+	servesFields      = set("name", "subject", "description")
 	discoveryFields   = set("category", "skills", "metadata")
 	skillFields       = set("id", "name", "description", "tags", "examples")
-	componentFields   = set("delivery", "activate_url", "event_url", "rpc_url", "timeout_s", "payloads")
+	componentFields   = set("delivery", "activate_url", "rpc_url", "timeout_s", "payloads")
 	configFields      = set("fields")
 	configFieldFields = set("name", "type", "required", "secret", "description", "enum", "default")
 	payloadFields     = set("alias", "name", "version", "config")
+
+	readExpectationFields = set("schema", "strict")
 )
 
 // List, string, and size limits the schema tables declare.
@@ -60,8 +72,9 @@ const (
 	maxWrites            = 128
 	maxConsumes          = 128
 	maxInvokes           = 32
-	maxEvents            = 64
-	maxEndpoints         = 32
+	maxSubscribes        = 128
+	maxPublishes         = 128
+	maxServes            = 32
 	maxSkills            = 32
 	maxTags              = 16
 	maxExamples          = 8
@@ -78,9 +91,10 @@ const (
 
 // fieldOrder is the document order findings sort by; an unlisted first segment sorts last (rule 4).
 var fieldOrder = map[string]int{
-	"": 0, "name": 1, "version": 2, "description": 3, "reads": 4, "writes": 5,
-	"consumes": 6, "precondition": 7, "activation": 8, "arbitration_group": 9,
-	"events": 10, "service": 11, "invokes": 12, "discovery": 13, "component": 14, "config": 15,
+	"": 0, "name": 1, "version": 2, "description": 3, "communication": 4, "reads": 5, "writes": 6,
+	"consumes": 7, "precondition": 8, "activation": 9, "arbitration_group": 10,
+	"subscribes": 11, "publishes": 12, "serves": 13, "single_flight": 14, "invokes": 15,
+	"discovery": 16, "component": 17, "config": 18, "write_schemas": 19, "read_expectations": 20,
 }
 
 // Validate reports every finding in a parsed manifest mapping, in deterministic order; it performs no I/O (rule 18).
@@ -128,6 +142,9 @@ func orderOf(path string) int {
 
 type validator struct {
 	findings []Finding
+	// communication is the effective mode every downstream judgment reads; an invalid value reports
+	// its own finding and the default arm is judged, so one bad enum never cascades (rule 37).
+	communication string
 }
 
 func (v *validator) add(code, path, message string) {
@@ -145,30 +162,29 @@ func (v *validator) run(data map[string]any) {
 	v.semver(data, "version", "version", true)
 	v.topDescription(data)
 
-	reads := v.patternList(data["reads"], "reads", maxReads, readCheck)
-	v.patternList(data["writes"], "writes", maxWrites, writeCheck)
-	v.patternList(data["events"], "events", maxEvents, eventCheck)
+	v.communication = v.communicationMode(data)
+
+	reads := v.patternList(data["reads"], "reads", maxReads, v.readCheck)
+	writes := v.patternList(data["writes"], "writes", maxWrites, v.writeCheck)
 	v.consumes(data["consumes"], reads)
 
 	v.precondition(data, reads)
 	v.activation(data)
 	v.arbitrationGroup(data)
 
-	service, hasService := data["service"]
-	if hasService {
-		v.service(service)
-	}
+	v.subscribes(data["subscribes"], reads, expectationKeys(data["read_expectations"]))
+	v.publishes(data["publishes"], writes)
+	v.serves(data["serves"])
+	v.singleFlight(data)
 	v.invokes(data["invokes"], data["name"])
 	if discovery, ok := data["discovery"]; ok {
 		v.discovery(discovery)
 	}
 
-	hasReads := listLen(data["reads"]) > 0
-	hasEvents := listLen(data["events"]) > 0
-	hasWrites := listLen(data["writes"]) > 0
+	hasServes := listLen(data["serves"]) > 0
 
 	if component, ok := data["component"]; ok {
-		v.component(component, hasEvents, hasService)
+		v.component(component, hasServes)
 	} else {
 		v.add("FIELD_REQUIRED", "component", "Field 'component' is required")
 	}
@@ -177,9 +193,33 @@ func (v *validator) run(data map[string]any) {
 		v.config(config)
 	}
 
-	if !hasReads && !hasEvents && !hasService && !hasWrites {
-		v.add("INERT_COMPONENT", "", "A component must declare at least one of reads, writes, events, or service")
+	v.writeSchemas(data["write_schemas"], writes)
+	v.readExpectations(data["read_expectations"], reads)
+
+	// Rule 15: the five activation sources and outputs; `invokes` is deliberately not among them.
+	inert := true
+	for _, field := range []string{"reads", "subscribes", "serves", "writes", "publishes"} {
+		if listLen(data[field]) > 0 {
+			inert = false
+		}
 	}
+	if inert {
+		v.add("INERT_COMPONENT", "",
+			"A component must declare at least one of reads, subscribes, serves, writes, or publishes")
+	}
+}
+
+// expectationKeys reports the read patterns a read_expectations map annotates (rule 37).
+func expectationKeys(raw any) map[string]bool {
+	block, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	keys := make(map[string]bool, len(block))
+	for key := range block {
+		keys[key] = true
+	}
+	return keys
 }
 
 // unknownFields reports every key outside the level's schema (rule 3).
@@ -314,9 +354,25 @@ func writeCheck(entry string) (string, string) {
 	return "", ""
 }
 
-func eventCheck(entry string) (string, string) {
-	if !subjectRE.MatchString(entry) {
-		return "SUBJECT_INVALID", fmt.Sprintf("%s is not a valid subject pattern", pyQuote(entry))
+// readCheck and writeCheck grammars, plus rule 37's bb. reservation once the pattern IS a subject.
+func (v *validator) readCheck(entry string) (string, string) {
+	if code, message := readCheck(entry); code != "" {
+		return code, message
+	}
+	return v.reservedPrefixCheck(entry)
+}
+
+func (v *validator) writeCheck(entry string) (string, string) {
+	if code, message := writeCheck(entry); code != "" {
+		return code, message
+	}
+	return v.reservedPrefixCheck(entry)
+}
+
+func (v *validator) reservedPrefixCheck(entry string) (string, string) {
+	if v.communication == communicationNATS && strings.Split(entry, ".")[0] == reservedSubjectPrefix {
+		return "SUBJECT_RESERVED", fmt.Sprintf(
+			"%s names the platform's reserved 'bb' prefix — a wire subject is user-space", pyQuote(entry))
 	}
 	return "", ""
 }
@@ -331,6 +387,12 @@ func (v *validator) consumes(raw any, reads []string) {
 	if !ok {
 		v.add("FIELD_TYPE", "consumes", "Field 'consumes' must be a list")
 		return
+	}
+	if v.communication == communicationNATS && len(entries) > 0 {
+		// Rule 37: the grammar and CONSUMES_UNREAD still apply; nothing is ever consumed.
+		v.warn("CONSUMES_INERT", "consumes",
+			"consumes is never consumed under communication: 'nats' — the activation trigger is the "+
+				"message, and no board key is read or written")
 	}
 	if len(entries) > maxConsumes {
 		v.add("LIMIT_EXCEEDED", "consumes", fmt.Sprintf("'consumes' may have at most %d entries", maxConsumes))
@@ -425,10 +487,19 @@ func (v *validator) precondition(data map[string]any, reads []string) {
 		v.add("FIELD_TYPE", "precondition", "Field 'precondition' must be a string")
 		return
 	}
+	if v.communication == communicationNATS {
+		// Rule 37: it must still parse and is otherwise never evaluated — the trigger is the message.
+		v.warn("PRECONDITION_INERT", "precondition",
+			"precondition is never evaluated under communication: 'nats' — the activation trigger is "+
+				"the message, not a board revision")
+	}
 	parsed, err := bb.ParsePrecondition(text)
 	if err != nil {
 		v.add("PRECONDITION_INVALID", "precondition", err.Error())
 		return
+	}
+	if v.communication == communicationNATS {
+		return // rule 10 does not run: there is no board snapshot to watch
 	}
 	for _, key := range parsed.ReferencedKeys() {
 		if coveredByAny(key, reads) {
@@ -487,95 +558,228 @@ func (v *validator) arbitrationGroup(data map[string]any) {
 	}
 }
 
-// --- service ---
+// --- communication and single_flight (rules 35, 37) ---
 
-func (v *validator) service(declared any) {
-	block, ok := declared.(map[string]any)
-	if !ok {
-		v.add("FIELD_TYPE", "service", "Field 'service' must be a mapping")
-		return
-	}
-	v.unknownFields(block, serviceFields, "service.")
-	if description, ok := block["description"]; ok {
-		v.optionalText(description, "service.description", maxDescription)
-	}
-	v.semver(block, "version", "service.version", false)
-
-	raw, present := block["endpoints"]
+// communicationMode validates the one switch and reports the effective mode to judge under.
+func (v *validator) communicationMode(data map[string]any) string {
+	raw, present := data["communication"]
 	if !present {
-		v.add("FIELD_REQUIRED", "service.endpoints", "service requires a non-empty 'endpoints' list")
-		return
+		return communicationBlackboard
 	}
-	endpoints, ok := raw.([]any)
+	text, ok := raw.(string)
 	if !ok {
-		v.add("FIELD_TYPE", "service.endpoints", "service.endpoints must be a list")
+		v.add("FIELD_TYPE", "communication", "Field 'communication' must be a string")
+		return communicationBlackboard
+	}
+	if !communications[text] {
+		v.add("ENUM_INVALID", "communication", fmt.Sprintf("%s is not 'blackboard' or 'nats'", pyQuote(text)))
+		return communicationBlackboard
+	}
+	return text
+}
+
+func (v *validator) singleFlight(data map[string]any) {
+	if raw, present := data["single_flight"]; present {
+		if _, ok := raw.(bool); !ok {
+			v.add("FIELD_TYPE", "single_flight", "Field 'single_flight' must be a boolean")
+		}
+	}
+}
+
+// --- subjects (rule 34) ---
+
+func (v *validator) subscribes(raw any, reads []string, expectations map[string]bool) {
+	entries, ok := v.subjectList(raw, "subscribes", maxSubscribes)
+	if !ok {
 		return
 	}
-	if len(endpoints) == 0 {
-		v.add("FIELD_REQUIRED", "service.endpoints", "service requires a non-empty 'endpoints' list")
+	seen := map[string]bool{}
+	for i, declared := range entries {
+		v.subscription(declared, fmt.Sprintf("subscribes[%d]", i), seen, reads, expectations)
+	}
+}
+
+// subscription validates one entry: its subject, its options, and rule 37's refinement judgment.
+func (v *validator) subscription(
+	declared any, base string, seen map[string]bool, reads []string, expectations map[string]bool,
+) {
+	entry, ok := declared.(map[string]any)
+	if !ok {
+		v.add("FIELD_TYPE", base, "Subscription must be a mapping")
 		return
 	}
-	if len(endpoints) > maxEndpoints {
-		v.add("LIMIT_EXCEEDED", "service.endpoints", fmt.Sprintf("at most %d endpoints", maxEndpoints))
+	v.unknownFields(entry, subscribesFields, base+".")
+	subject, named := v.subject(entry, base, seen, true, true)
+	if raw, present := entry["durable"]; present {
+		if _, ok := raw.(bool); !ok {
+			v.add("FIELD_TYPE", base+".durable", base+".durable must be a boolean")
+		}
+	}
+	if raw, present := entry["mode"]; present {
+		mode, ok := raw.(string)
+		switch {
+		case !ok:
+			v.add("FIELD_TYPE", base+".mode", base+".mode must be a string")
+		case !subscriptionModes[mode]:
+			v.add("SUBSCRIPTION_OPTION_INVALID", base+".mode",
+				fmt.Sprintf("%s is not 'broadcast' or 'queue'", pyQuote(mode)))
+		}
+	}
+	source, hasSchema := entry["schema"]
+	if hasSchema {
+		v.schemaSource(source, base+".schema")
+	}
+	raw, hasStrict := entry["strict"]
+	if hasStrict {
+		strict, ok := raw.(bool)
+		switch {
+		case !ok:
+			v.add("FIELD_TYPE", base+".strict", base+".strict must be a boolean")
+		case strict && !hasSchema:
+			v.add("SUBSCRIPTION_OPTION_INVALID", base+".strict",
+				"strict: true requires a schema — a strict gate needs a shape to gate on")
+		}
+	}
+	// Rule 37: under `nats` an entry byte-identical to a reads pattern REFINES that read, and a
+	// refined read takes its shape from one source only.
+	if v.communication == communicationNATS && named && (hasSchema || hasStrict) &&
+		contains(reads, subject) && expectations[subject] {
+		v.add("SUBSCRIPTION_OPTION_INVALID", base, fmt.Sprintf(
+			"%s refines a reads pattern that already carries a read_expectations entry — a refined "+
+				"read may take its shape from one source only", pyQuote(subject)))
+	}
+}
+
+func (v *validator) publishes(raw any, writes []string) {
+	entries, ok := v.subjectList(raw, "publishes", maxPublishes)
+	if !ok {
+		return
+	}
+	seen := map[string]bool{}
+	for i, declared := range entries {
+		base := fmt.Sprintf("publishes[%d]", i)
+		entry, ok := declared.(map[string]any)
+		if !ok {
+			v.add("FIELD_TYPE", base, "Publication must be a mapping")
+			continue
+		}
+		v.unknownFields(entry, publishesFields, base+".")
+		subject, named := v.subject(entry, base, seen, false, true)
+		if source, present := entry["schema"]; present {
+			v.schemaSource(source, base+".schema")
+		}
+		if !named || !intersectsAny(subject, writes) {
+			continue
+		}
+		// Rule 34: under `blackboard` an overlapping name could not route (SUBJECT_KEY_OVERLAP);
+		// rule 37: under `nats` writes and publishes are one namespace, so it is a duplicate.
+		if v.communication == communicationNATS {
+			v.add("DUPLICATE_ENTRY", base,
+				fmt.Sprintf("%s is already covered by a writes publication scope", pyQuote(subject)))
+		} else {
+			v.add("SUBJECT_KEY_OVERLAP", base, fmt.Sprintf(
+				"%s is intersected by a writes pattern — the returned name could not be routed "+
+					"unambiguously", pyQuote(subject)))
+		}
+	}
+}
+
+func (v *validator) serves(raw any) {
+	entries, ok := v.subjectList(raw, "serves", maxServes)
+	if !ok {
+		return
 	}
 	seenNames := map[string]bool{}
 	seenSubjects := map[string]bool{}
-	for i, raw := range endpoints {
-		base := fmt.Sprintf("service.endpoints[%d]", i)
-		endpoint, ok := raw.(map[string]any)
+	for i, declared := range entries {
+		base := fmt.Sprintf("serves[%d]", i)
+		entry, ok := declared.(map[string]any)
 		if !ok {
-			v.add("FIELD_TYPE", base, "Endpoint must be a mapping")
+			v.add("FIELD_TYPE", base, "Served endpoint must be a mapping")
 			continue
 		}
-		v.unknownFields(endpoint, endpointFields, base+".")
-		v.endpointName(endpoint, base+".name", seenNames)
-		v.endpointSubject(endpoint, base+".subject", seenSubjects)
-		if description, ok := endpoint["description"]; ok {
+		v.unknownFields(entry, servesFields, base+".")
+		v.servesName(entry, base+".name", seenNames)
+		// A served endpoint's literal subject may lawfully equal its canonical bb.svc.… form.
+		v.subject(entry, base, seenSubjects, false, false)
+		if description, present := entry["description"]; present {
 			v.optionalText(description, base+".description", maxDescription)
 		}
 	}
 }
 
-func (v *validator) endpointName(endpoint map[string]any, path string, seen map[string]bool) {
-	raw, present := endpoint["name"]
+// subjectList reports the container findings of one subject list and whether its entries are judgeable.
+func (v *validator) subjectList(raw any, field string, limit int) ([]any, bool) {
+	if raw == nil {
+		return nil, false
+	}
+	entries, ok := raw.([]any)
+	if !ok {
+		v.add("FIELD_TYPE", field, fmt.Sprintf("Field %s must be a list", pyQuote(field)))
+		return nil, false
+	}
+	if len(entries) > limit {
+		v.add("LIMIT_EXCEEDED", field, fmt.Sprintf("%s may have at most %d entries", pyQuote(field), limit))
+	}
+	return entries, true
+}
+
+// subject validates one entry's subject. Duplicate detection precedes grammar per entry index (the
+// rule-29/31 shape); the reserved prefix condemns the whole declaration, so it is reported at the
+// entry's path (rule 34).
+func (v *validator) subject(
+	entry map[string]any, base string, seen map[string]bool, wildcards, reserved bool,
+) (string, bool) {
+	path := base + ".subject"
+	raw, present := entry["subject"]
 	if !present {
-		v.add("FIELD_REQUIRED", path, "Endpoint 'name' is required")
+		v.add("FIELD_REQUIRED", path, path+" is required")
+		return "", false
+	}
+	text, ok := raw.(string)
+	if !ok {
+		v.add("FIELD_TYPE", path, path+" must be a string")
+		return "", false
+	}
+	if seen[text] {
+		v.add("DUPLICATE_ENTRY", path, fmt.Sprintf("Duplicate subject %s", pyQuote(text)))
+		return "", false
+	}
+	seen[text] = true
+	grammar, label := subjectRE, "a valid subject"
+	if !wildcards {
+		grammar, label = literalSubjectRE, "a literal subject"
+	}
+	if !grammar.MatchString(text) {
+		v.add("SUBJECT_INVALID", path, fmt.Sprintf("%s is not %s", pyQuote(text), label))
+		return "", false
+	}
+	if reserved && strings.Split(text, ".")[0] == reservedSubjectPrefix {
+		v.add("SUBJECT_RESERVED", base, fmt.Sprintf(
+			"%s names the platform's reserved 'bb' prefix — a wire subject is user-space", pyQuote(text)))
+	}
+	return text, true
+}
+
+func (v *validator) servesName(entry map[string]any, path string, seen map[string]bool) {
+	raw, present := entry["name"]
+	if !present {
+		v.add("FIELD_REQUIRED", path, path+" is required")
 		return
 	}
 	text, ok := raw.(string)
 	if !ok {
-		v.add("FIELD_TYPE", path, "Endpoint 'name' must be a string")
-		return
-	}
-	if !nameRE.MatchString(text) {
-		v.add("NAME_INVALID", path, fmt.Sprintf("%s does not match ^[A-Za-z][A-Za-z0-9_-]{0,63}$", pyQuote(text)))
+		v.add("FIELD_TYPE", path, path+" must be a string")
 		return
 	}
 	if seen[text] {
 		v.add("DUPLICATE_ENTRY", path, fmt.Sprintf("Duplicate endpoint name %s", pyQuote(text)))
+		return
 	}
 	seen[text] = true
-}
-
-func (v *validator) endpointSubject(endpoint map[string]any, path string, seen map[string]bool) {
-	raw, present := endpoint["subject"]
-	if !present {
-		v.add("FIELD_REQUIRED", path, "Endpoint 'subject' is required")
-		return
+	if !nameRE.MatchString(text) {
+		v.add("NAME_INVALID", path, fmt.Sprintf("%s does not match ^[A-Za-z][A-Za-z0-9_-]{0,63}$", pyQuote(text)))
 	}
-	text, ok := raw.(string)
-	if !ok {
-		v.add("FIELD_TYPE", path, "Endpoint 'subject' must be a string")
-		return
-	}
-	if !literalSubjectRE.MatchString(text) {
-		v.add("SUBJECT_INVALID", path, fmt.Sprintf("%s is not a literal subject", pyQuote(text)))
-		return
-	}
-	if seen[text] {
-		v.add("DUPLICATE_ENTRY", path, fmt.Sprintf("Duplicate endpoint subject %s", pyQuote(text)))
-	}
-	seen[text] = true
 }
 
 // --- discovery ---
@@ -711,7 +915,7 @@ func (v *validator) metadata(raw any) {
 
 // --- component ---
 
-func (v *validator) component(raw any, hasEvents, hasService bool) {
+func (v *validator) component(raw any, hasServes bool) {
 	block, ok := raw.(map[string]any)
 	if !ok {
 		v.add("FIELD_TYPE", "component", "Field 'component' must be a mapping")
@@ -735,7 +939,7 @@ func (v *validator) component(raw any, hasEvents, hasService bool) {
 		}
 	}
 
-	urlFields := []string{"activate_url", "event_url", "rpc_url"}
+	urlFields := []string{"activate_url", "rpc_url"}
 	for _, field := range urlFields {
 		if raw, present := block[field]; present {
 			if _, ok := raw.(string); !ok {
@@ -747,8 +951,9 @@ func (v *validator) component(raw any, hasEvents, hasService bool) {
 	v.timeout(block)
 	v.payloads(block)
 
-	if deliveryValid && delivery == deliveryPull && hasService {
-		v.add("DELIVERY_UNSUPPORTED", "component", "delivery: pull with a service is unsupported in this version")
+	if deliveryValid && delivery == deliveryPull && hasServes {
+		v.add("DELIVERY_UNSUPPORTED", "component",
+			"delivery: pull with a non-empty serves list is unsupported in this version")
 	}
 
 	var allowed map[string]bool
@@ -756,12 +961,9 @@ func (v *validator) component(raw any, hasEvents, hasService bool) {
 	case !deliveryValid:
 		allowed = set(urlFields...)
 	case delivery == deliveryPush:
-		v.gatePush(block, hasEvents, hasService)
+		v.gatePush(block, hasServes)
 		allowed = set("activate_url")
-		if hasEvents {
-			allowed["event_url"] = true
-		}
-		if hasService {
+		if hasServes {
 			allowed["rpc_url"] = true
 		}
 	default:
@@ -802,21 +1004,15 @@ func (v *validator) componentURL(raw, path string) {
 }
 
 // gatePush enforces which callback URLs a push manifest must and must not carry (rule 13).
-func (v *validator) gatePush(block map[string]any, hasEvents, hasService bool) {
-	// activate_url is optional for push: absent, the loaded model applies the default.
-	_, hasEventURL := block["event_url"]
-	if hasEvents && !hasEventURL {
-		v.add("DELIVERY_CONFLICT", "component.event_url", "event_url is required when events are declared")
-	}
-	if !hasEvents && hasEventURL {
-		v.add("DELIVERY_CONFLICT", "component.event_url", "event_url is forbidden when no events are declared")
-	}
+func (v *validator) gatePush(block map[string]any, hasServes bool) {
+	// activate_url is optional for push: absent, the loaded model applies the default. There is no
+	// event webhook: every subject activation reaches activate_url (rules 13, 34).
 	_, hasRPCURL := block["rpc_url"]
-	if hasService && !hasRPCURL {
-		v.add("DELIVERY_CONFLICT", "component.rpc_url", "rpc_url is required when a service is declared")
+	if hasServes && !hasRPCURL {
+		v.add("DELIVERY_CONFLICT", "component.rpc_url", "rpc_url is required when serves is non-empty")
 	}
-	if !hasService && hasRPCURL {
-		v.add("DELIVERY_CONFLICT", "component.rpc_url", "rpc_url is forbidden when no service is declared")
+	if !hasServes && hasRPCURL {
+		v.add("DELIVERY_CONFLICT", "component.rpc_url", "rpc_url is forbidden when serves is empty")
 	}
 }
 
@@ -1077,6 +1273,135 @@ func (v *validator) configDefault(value any, declaredType string, enumValues []s
 	if !ok {
 		v.add("CONFIG_INVALID", path, fmt.Sprintf("default does not match field type %s", pyQuote(declaredType)))
 	}
+}
+
+// --- declared shapes (rule 33) ---
+
+// writeSchemas validates the map from a writes entry to the shape this component claims for it.
+// Validation is structural only: no path is read and no document is checked against the JSON Schema
+// meta-schema (rule 18's purity stands, and this package gains no dependency).
+func (v *validator) writeSchemas(raw any, writes []string) {
+	block, keys := v.schemaMap(raw, "write_schemas", writes, "writes")
+	for _, key := range keys {
+		v.schemaSource(block[key], "write_schemas."+key)
+	}
+}
+
+// readExpectations validates the map from a reads entry to its {schema, strict} entry object.
+func (v *validator) readExpectations(raw any, reads []string) {
+	block, keys := v.schemaMap(raw, "read_expectations", reads, "reads")
+	for _, key := range keys {
+		v.readExpectation(block[key], "read_expectations."+key)
+	}
+}
+
+// schemaMap reports the container and key findings of a declared-shape map and returns its entries with
+// their keys in sorted order. Keys are matched by exact string equality, never PatternsIntersect: the map
+// annotates a declared entry, it does not introduce one.
+func (v *validator) schemaMap(raw any, field string, declared []string, declaredField string) (map[string]any, []string) {
+	if raw == nil {
+		return nil, nil
+	}
+	block, ok := raw.(map[string]any)
+	if !ok {
+		v.add("FIELD_TYPE", field, fmt.Sprintf("Field %s must be a mapping", pyQuote(field)))
+		return nil, nil
+	}
+	keys := make([]string, 0, len(block))
+	for key := range block {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if !contains(declared, key) {
+			v.add("SCHEMA_KEY_UNDECLARED", field+"."+key, fmt.Sprintf(
+				"%s is not a declared %s entry — a shape annotates a declared entry, it never introduces one",
+				pyQuote(key), declaredField))
+		}
+	}
+	return block, keys
+}
+
+// schemaSource validates one source: an inline JSON Schema document, a package-relative .json path,
+// or a dict:<name>@<version> dictionary reference judged by grammar alone (rule 33).
+func (v *validator) schemaSource(declared any, path string) {
+	if _, inline := declared.(map[string]any); inline {
+		return
+	}
+	source, ok := declared.(string)
+	if !ok {
+		v.add("FIELD_TYPE", path, path+" must be an inline schema document, a package-relative .json path, "+
+			"or a dict:<name>@<version> dictionary reference")
+		return
+	}
+	if strings.HasPrefix(source, DictionaryPrefix) {
+		if _, _, valid := DictionaryReference(source); !valid {
+			v.add("SCHEMA_SOURCE_INVALID", path, fmt.Sprintf(
+				"%s is not a dict:<name>@<version> dictionary reference — the name must match "+
+					"^[A-Za-z][A-Za-z0-9_-]{0,63}$ and the version must be semver, separated by exactly one '@'",
+				pyQuote(source)))
+		}
+		return
+	}
+	if !validSchemaPath(source) {
+		v.add("SCHEMA_SOURCE_INVALID", path, fmt.Sprintf(
+			"%s is not a package-relative .json path — it must be non-empty, carry no leading '/' "+
+				"and no '..' segment, and end in '.json'", pyQuote(source)))
+	}
+}
+
+// readExpectation validates one entry object: a required schema source and an optional strict marker.
+func (v *validator) readExpectation(declared any, base string) {
+	entry, ok := declared.(map[string]any)
+	if !ok {
+		v.add("FIELD_TYPE", base, base+" must be a mapping")
+		return
+	}
+	v.unknownFields(entry, readExpectationFields, base+".")
+	if source, present := entry["schema"]; present {
+		v.schemaSource(source, base+".schema")
+	} else {
+		v.add("FIELD_REQUIRED", base+".schema", base+".schema is required")
+	}
+	if strict, present := entry["strict"]; present {
+		if _, ok := strict.(bool); !ok {
+			v.add("FIELD_TYPE", base+".strict", base+".strict must be a boolean")
+		}
+	}
+}
+
+// DictionaryPrefix marks a schema source as a dictionary reference (rule 33).
+const DictionaryPrefix = "dict:"
+
+// dictionaryReferenceRE is rule 33's reference grammar: the name grammar, a semver version, and —
+// since neither half admits an "@" — exactly one separator.
+var dictionaryReferenceRE = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]{0,63})@(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$`)
+
+// DictionaryReference reports the name and version a dict:<name>@<version> schema source names.
+func DictionaryReference(source string) (string, string, bool) {
+	// Grammar is the whole judgment (rule 33): this package resolves nothing and reads nothing.
+	if !strings.HasPrefix(source, DictionaryPrefix) {
+		return "", "", false
+	}
+	found := dictionaryReferenceRE.FindStringSubmatch(strings.TrimPrefix(source, DictionaryPrefix))
+	if found == nil {
+		return "", "", false
+	}
+	return found[1], found[2], true
+}
+
+// validSchemaPath reports whether a path-form source is non-empty, relative, free of ".." segments,
+// and .json-suffixed (rule 33).
+func validSchemaPath(source string) bool {
+	if source == "" || strings.HasPrefix(source, "/") || !strings.HasSuffix(source, ".json") {
+		return false
+	}
+	for _, segment := range strings.Split(source, "/") {
+		if segment == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // --- shared helpers ---

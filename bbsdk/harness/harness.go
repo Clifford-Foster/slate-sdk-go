@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -38,8 +39,6 @@ type Options struct {
 	Epoch time.Time
 	// StrictReads scopes an activation's Get to the manifest reads; it is off by default (rule H13).
 	StrictReads bool
-	// OnEvent handles an EmitEvent delivery; without it EmitEvent is a state error (rule H13).
-	OnEvent bbsdk.EventFunc
 	// RPCHandlers are the bridged endpoints CallRPC routes to (rule H13).
 	RPCHandlers map[string]bbsdk.RPCFunc
 	// InvokeResponders are the invoke fake's answers, by service then endpoint (rule H14).
@@ -58,6 +57,17 @@ type Harness struct {
 	store     *board
 	board     *blackboard.Blackboard
 	agent     *blackboard.Agent
+	// shapes are the manifest's declared write, read, publish and subscribe schemas, prepared at
+	// construction so an unpreparable one fails there rather than on the first write (rules H20, H21).
+	shapes *shapes
+	// watchedReads are the keys the engine watches: the manifest's reads under blackboard, and none
+	// under nats, where every read is a subscription instead and no board watch exists (rule H21).
+	watchedReads []string
+	// subscriptions is the effective subscription set Publish resolves a subject against (rule H21).
+	subscriptions []manifest.Subscription
+	// guard is the single-flight guard both activation sources share under a declared single_flight
+	// (rule B39); under false a subject activation takes none of it.
+	guard *flightGuard
 
 	mu sync.Mutex
 	// changed is closed and replaced on every observable step, so a waiter parks without polling.
@@ -74,15 +84,45 @@ type Harness struct {
 	deliveries int
 	records    []Record
 	cursor     int
+	skips      []ValidationSkip
+	// published is every message the component published, in order (rule H21).
+	published []Published
+	// subjectPending counts the subject activations queued or running, so Settle and Stop wait for
+	// them exactly as they wait for a board activation (rules H10, H11, H21).
+	subjectPending int
 }
 
 // New builds a harness over a validated manifest and the component's activation function (rule H1).
+// A path-form schema source fails here: New has no manifest document to resolve it against, and
+// rule H16 forbids the harness the read (rule H20).
 func New(m *manifest.Manifest, component bbsdk.ActivationFunc, opts Options) (*Harness, error) {
+	return build(m, component, opts, "")
+}
+
+// Open loads a manifest from disk and builds a harness over it (rule H1). A path-form schema source
+// resolves against the manifest document's parent directory (rule H20).
+func Open(path string, component bbsdk.ActivationFunc, opts Options) (*Harness, error) {
+	// The manifest package's validation error propagates unchanged: the harness validates nothing
+	// of its own, so a document rejected here is rejected in production (rules M1, H1).
+	loaded, err := manifest.Load(path)
+	if err != nil {
+		return nil, err
+	}
+	return build(loaded, component, opts, filepath.Dir(path))
+}
+
+// build is the one construction path, carrying the directory a path-form schema source resolves
+// against — Open's, and never New's (rule H20).
+func build(m *manifest.Manifest, component bbsdk.ActivationFunc, opts Options, dir string) (*Harness, error) {
 	if m == nil {
 		return nil, errors.New("harness: New needs a validated manifest")
 	}
 	if component == nil {
 		return nil, errors.New("harness: New needs a component function")
+	}
+	prepared, err := prepareShapes(m, dir)
+	if err != nil {
+		return nil, err
 	}
 	epoch := opts.Epoch
 	if epoch.IsZero() {
@@ -93,19 +133,27 @@ func New(m *manifest.Manifest, component bbsdk.ActivationFunc, opts Options) (*H
 		config = map[string]any{}
 	}
 	h := &Harness{
-		loaded:    m,
-		component: component,
-		options:   opts,
-		config:    config,
-		clock:     &clock{at: epoch.UTC()},
-		changed:   make(chan struct{}),
+		loaded:        m,
+		component:     component,
+		options:       opts,
+		config:        config,
+		clock:         &clock{at: epoch.UTC()},
+		shapes:        prepared,
+		subscriptions: subscriptions(m),
+		guard:         &flightGuard{},
+		changed:       make(chan struct{}),
+	}
+	// Under nats there is no board watch and the precondition is inert: every reads pattern is a
+	// subscription instead, so the engine watches nothing and a Put triggers no activation (rule H21).
+	if m.Communication != manifestCommunicationNATS {
+		h.watchedReads = m.Reads
 	}
 	h.store = newBoard(h.clock)
 	h.board = blackboard.New(h.store)
 	// Debounce, snapshot tracking, CHANGED, the single-flight guard and coalesce-not-drop are the
 	// core's; only the clock and the observation seam are the harness's (rules H2, H5).
 	agent, err := blackboard.NewAgent(blackboard.AgentSpec{
-		Reads:        m.Reads,
+		Reads:        h.watchedReads,
 		Writes:       m.Writes,
 		Precondition: m.Precondition,
 		Activate:     h.activate,
@@ -115,17 +163,6 @@ func New(m *manifest.Manifest, component bbsdk.ActivationFunc, opts Options) (*H
 	}
 	h.agent = agent
 	return h, nil
-}
-
-// Open loads a manifest from disk and builds a harness over it (rule H1).
-func Open(path string, component bbsdk.ActivationFunc, opts Options) (*Harness, error) {
-	// The manifest package's validation error propagates unchanged: the harness validates nothing
-	// of its own, so a document rejected here is rejected in production (rules M1, H1).
-	loaded, err := manifest.Load(path)
-	if err != nil {
-		return nil, err
-	}
-	return New(loaded, component, opts)
 }
 
 // Seed writes pre-start state, as another component or the platform would have (rules H7, H10).
@@ -172,6 +209,12 @@ func (h *Harness) Stop(ctx context.Context) error {
 	if !started {
 		return nil
 	}
+	// A queued or running subject activation is in-flight work exactly as a board one is, and it may
+	// be holding the guard the engine's own activation is waiting on, so it is drained first (rules
+	// H10, H21).
+	if err := h.await(ctx, func() bool { return h.subjectPending == 0 }); err != nil {
+		return err
+	}
 	// Agent.Stop returns once the evaluation loop — and any activation running inside it — is done.
 	err := h.agent.Stop(ctx)
 	cancel()
@@ -184,6 +227,21 @@ func (h *Harness) Stop(ctx context.Context) error {
 // Get reads one key straight off the in-memory board, nil when it is absent.
 func (h *Harness) Get(key string) (*blackboard.Entry, error) {
 	return h.board.Get(context.Background(), key)
+}
+
+// readsSnapshot is the manifest-reads snapshot a subject activation carries: the current value of
+// every watched key, empty when the component declares no reads — and empty under nats, where no
+// board watch exists at all (rules H21, K21).
+func (h *Harness) readsSnapshot() map[string]map[string]any {
+	snapshot := map[string]map[string]any{}
+	for key := range h.store.revisions(h.watchedReads) {
+		entry, err := h.board.Get(context.Background(), key)
+		if err != nil || entry == nil {
+			continue
+		}
+		snapshot[key] = entry.Value
+	}
+	return snapshot
 }
 
 // Put writes any key as an external actor would, under no write grant at all (rules H7, H10).
@@ -220,17 +278,9 @@ func (h *Harness) DeleteCAS(_ context.Context, key string, revision uint64) erro
 	return err
 }
 
-// EmitEvent drives the component's event handler; it takes no guard and produces no record (rule H13).
-func (h *Harness) EmitEvent(ctx context.Context, subject string, payload map[string]any) error {
-	if err := h.started("EmitEvent"); err != nil {
-		return err
-	}
-	if h.options.OnEvent == nil {
-		return fmt.Errorf("%w: the harness carries no event handler", ErrHarnessState)
-	}
-	// The handler's own writes land on the board and may themselves trigger an activation (rule H13).
-	return h.options.OnEvent(ctx, bbsdk.HarnessEvent(h.delivery("event"), subject, payload, h.config))
-}
+// EmitEvent and Options.OnEvent are retired with the event-handler path (rule H13, Clifford's D2
+// ruling, 2026-09-01; test_harness.md rule 30 likewise): a subscription's message is driven by rule
+// H21's Publish into the one component function there is.
 
 // CallRPC invokes one bridged endpoint and returns its reply; {} stands in for a nil one (rule H13).
 func (h *Harness) CallRPC(ctx context.Context, endpoint string, payload []byte) (map[string]any, error) {
@@ -310,7 +360,8 @@ func (h *Harness) Activations() []Record {
 // engine's own snapshot revisions are what prove delivery — a write not yet delivered, a debounce
 // window still open and a coalesced re-evaluation all leave the two views unequal (rule H11).
 func (h *Harness) quiet() bool {
-	return !h.inFlight && maps.Equal(h.delivered, h.store.revisions(h.loaded.Reads))
+	return !h.inFlight && h.subjectPending == 0 &&
+		maps.Equal(h.delivered, h.store.revisions(h.watchedReads))
 }
 
 // await parks until done — always evaluated under the harness lock — reports true, returning
