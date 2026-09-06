@@ -3,6 +3,7 @@ module github.com/Clifford-Foster/slate-sdk-go
 go 1.26
 
 require (
+	github.com/coder/websocket v1.8.14
 	github.com/nats-io/nats.go v1.52.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	gopkg.in/yaml.v3 v3.0.1

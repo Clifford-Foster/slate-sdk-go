@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // ErrSidecar is the base of every data-plane failure; every returned boundary error wraps it (rule E2).
@@ -89,6 +90,8 @@ type SidecarError struct {
 	Rule string
 	// Status is the HTTP status, or 0 for a verdict the SDK raised locally (rule E6).
 	Status int
+	// RetryAfter carries the Retry-After a 429 reported, zero everywhere else (bbsdk/gateway, rule W2).
+	RetryAfter time.Duration
 	// Validation carries the envelope's verdicts, empty except on SCHEMA_VIOLATION (rule E8).
 	Validation []ValidationVerdict
 	// invoke marks a failure from the invoke route, whose every code is the one class (rule E5).
