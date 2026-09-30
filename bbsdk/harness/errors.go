@@ -2,7 +2,11 @@ package harness
 
 import (
 	"errors"
+	"fmt"
 	"strings"
+
+	bbsdk "github.com/Clifford-Foster/slate-sdk-go/bbsdk"
+	"github.com/Clifford-Foster/slate-sdk-go/blackboard"
 )
 
 // ErrUndeclaredWrite reports a component write outside its manifest grants, to meta.*, or to a
@@ -14,6 +18,21 @@ var ErrUndeclaredRead = errors.New("harness: the component read a key it did not
 
 // ErrHarnessState reports a call made in the wrong lifecycle state (rules H10, H13).
 var ErrHarnessState = errors.New("harness: the call does not fit the harness state")
+
+// sdkSentinel wraps a core compare-and-set or value error with its rule-E2 sentinel, so the one error
+// satisfies errors.Is against both; any other error passes unchanged (rule H22).
+func sdkSentinel(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, blackboard.ErrRevisionConflict):
+		return fmt.Errorf("%w: %w", bbsdk.ErrRevisionConflict, err)
+	case errors.Is(err, blackboard.ErrInvalidValue):
+		return fmt.Errorf("%w: %w", bbsdk.ErrValueInvalid, err)
+	default:
+		return err
+	}
+}
 
 // The invoke fake's verdicts, in the sidecar's own error-code vocabulary (rule H14).
 const (

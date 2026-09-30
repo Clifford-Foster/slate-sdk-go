@@ -217,7 +217,7 @@ func (h *Harness) applyReturned(ctx context.Context, delivery *plane, writes bbs
 		revision, err := h.board.Put(ctx, key, value)
 		if err != nil {
 			// KV has no transactions: a value-rule failure mid-apply keeps what already landed.
-			return fmt.Errorf("harness: applying the returned write %q: %w", key, err)
+			return fmt.Errorf("harness: applying the returned write %q: %w", key, sdkSentinel(err))
 		}
 		delivery.record(Write{Key: key, Value: value, Revision: revision})
 	}

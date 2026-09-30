@@ -39,7 +39,7 @@ implements:
 
 | Contract | Version | Covers |
 | --- | --- | --- |
-| `contracts/bb_sdk_go.md` | 0.15.0 | `bbsdk`, `bbsdk/harness`, `bbsdk/schema` |
+| `contracts/bb_sdk_go.md` | 0.16.0 | `bbsdk`, `bbsdk/harness`, `bbsdk/schema` |
 | `contracts/components_runtime.md` | 0.24.0 | `bbsdk/components` |
 | `contracts/sidecar.md` | 0.36.3 | the component ↔ sidecar boundary `bbsdk` speaks |
 | `contracts/blackboard_platform.md` | 0.38.0 | `blackboard` |

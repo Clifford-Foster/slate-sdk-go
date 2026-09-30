@@ -174,7 +174,7 @@ func (h *Harness) Seed(key string, value map[string]any) error {
 	}
 	h.mu.Unlock()
 	_, err := h.board.Put(context.Background(), key, value)
-	return err
+	return sdkSentinel(err)
 }
 
 // Start arms the engine's watches and begins evaluating; ctx bounds the start, not the run (rule H10).
@@ -249,7 +249,8 @@ func (h *Harness) Put(ctx context.Context, key string, value map[string]any) (ui
 	if err := h.started("Put"); err != nil {
 		return 0, err
 	}
-	return h.board.Put(ctx, key, value)
+	revision, err := h.board.Put(ctx, key, value)
+	return revision, sdkSentinel(err)
 }
 
 // PutCAS writes any key while it stands at revision, as an external actor would (rules H7, H10).
@@ -257,7 +258,8 @@ func (h *Harness) PutCAS(ctx context.Context, key string, value map[string]any, 
 	if err := h.started("PutCAS"); err != nil {
 		return 0, err
 	}
-	return h.board.PutCAS(ctx, key, value, revision)
+	written, err := h.board.PutCAS(ctx, key, value, revision)
+	return written, sdkSentinel(err)
 }
 
 // Delete removes any key as an external actor would (rules H7, H10).
@@ -275,7 +277,7 @@ func (h *Harness) DeleteCAS(_ context.Context, key string, revision uint64) erro
 		return err
 	}
 	_, err := h.store.deleteCAS(key, revision)
-	return err
+	return sdkSentinel(err)
 }
 
 // EmitEvent and Options.OnEvent are retired with the event-handler path (rule H13, Clifford's D2

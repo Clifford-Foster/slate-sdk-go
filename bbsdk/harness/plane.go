@@ -67,20 +67,20 @@ func (p *plane) Put(ctx context.Context, key string, value map[string]any) (uint
 	stamped := stampCorrelation(value, p.inherited)
 	revision, err := p.harness.board.Put(ctx, key, stamped)
 	if err != nil {
-		return 0, err
+		return 0, sdkSentinel(err)
 	}
 	p.record(Write{Key: key, Value: stamped, Revision: revision})
 	return revision, nil
 }
 
 // PutCAS writes a declared key only while it stands at revision (rules H7, H8). Under nats a CAS has
-// no meaning on a publication, so it is the core library's ErrInvalidValue — the harness's analog of
-// the sidecar's 422 BODY_INVALID (rule H21).
+// no meaning on a publication, so it is an error satisfying both ErrValueInvalid and the core
+// library's ErrInvalidValue — the harness's analog of the sidecar's 422 BODY_INVALID (rules H21, H22).
 func (p *plane) PutCAS(ctx context.Context, key string, value map[string]any, revision uint64) (uint64, error) {
 	if p.harness.publishing() {
-		return 0, fmt.Errorf(
+		return 0, sdkSentinel(fmt.Errorf(
 			"%w: a compare-and-swap put has no meaning on a publication — the manifest declares communication: nats",
-			blackboard.ErrInvalidValue)
+			blackboard.ErrInvalidValue))
 	}
 	if err := p.authorize(key); err != nil {
 		return 0, err
@@ -91,7 +91,7 @@ func (p *plane) PutCAS(ctx context.Context, key string, value map[string]any, re
 	stamped := stampCorrelation(value, p.inherited)
 	written, err := p.harness.board.PutCAS(ctx, key, stamped, revision)
 	if err != nil {
-		return 0, err
+		return 0, sdkSentinel(err)
 	}
 	p.record(Write{Key: key, Value: stamped, Revision: written})
 	return written, nil
@@ -121,7 +121,7 @@ func (p *plane) DeleteCAS(_ context.Context, key string, revision uint64) error 
 	}
 	written, err := p.harness.store.deleteCAS(key, revision)
 	if err != nil {
-		return err
+		return sdkSentinel(err)
 	}
 	if written != 0 {
 		// An absent key is a no-op that removed nothing, so no delete is recorded for it.
