@@ -97,6 +97,8 @@ type Activation struct {
 	Snapshot map[string]map[string]any
 	// ChangedKeys is the sorted, de-duplicated set of keys whose change produced this evaluation.
 	ChangedKeys []string
+	// Revisions is the delivery identity: each changed key's revision, empty when the payload carries none (rule B3).
+	Revisions map[string]uint64
 	// Config is the parsed BB_CONFIG: the same map on every activation, read-only by convention (rule C3).
 	Config map[string]any
 
@@ -112,6 +114,7 @@ type activationPayload struct {
 	BlackboardID string                    `json:"blackboard_id"`
 	Snapshot     map[string]map[string]any `json:"snapshot"`
 	ChangedKeys  []string                  `json:"changed_keys"`
+	Revisions    map[string]uint64         `json:"revisions"`
 	ActivationID string                    `json:"activation_id"`
 	// Source is a pointer so its absence stays distinguishable from a zero value: a payload carrying
 	// no source member at all is an older sidecar's, and defaults to the board kind (rule K21).
@@ -128,6 +131,17 @@ func (p activationPayload) source() ActivationSource {
 		return ActivationSource{Kind: sourceKindBoard}
 	}
 	return *p.Source
+}
+
+// revisions reads the payload's revisions member — the delivery identity of sidecar.md rule B3,
+// the key a component dedups a side effect on. A payload carrying none (a sidecar older than
+// 0.34.0) yields an empty map rather than nil, so a component indexes one shape on every
+// activation and never branches on absence.
+func (p activationPayload) revisions() map[string]uint64 {
+	if p.Revisions == nil {
+		return map[string]uint64{}
+	}
+	return p.Revisions
 }
 
 // decodeActivation decodes an ActivationPayload, leaving the fields a body lacks at their zero
@@ -152,6 +166,7 @@ func newActivation(payload activationPayload, plane dataPlane, config map[string
 		InputB64:     payload.InputB64,
 		Snapshot:     payload.Snapshot,
 		ChangedKeys:  payload.ChangedKeys,
+		Revisions:    payload.revisions(),
 		Config:       config,
 		dataPlane:    plane,
 	}

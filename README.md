@@ -39,11 +39,11 @@ implements:
 
 | Contract | Version | Covers |
 | --- | --- | --- |
-| `contracts/bb_sdk_go.md` | 0.13.1 | `bbsdk`, `bbsdk/harness`, `bbsdk/schema` |
+| `contracts/bb_sdk_go.md` | 0.15.0 | `bbsdk`, `bbsdk/harness`, `bbsdk/schema` |
 | `contracts/components_runtime.md` | 0.24.0 | `bbsdk/components` |
-| `contracts/sidecar.md` | 0.28.0 | the component ↔ sidecar boundary `bbsdk` speaks |
-| `contracts/blackboard_platform.md` | 0.34.4 | `blackboard` |
-| `contracts/manifest.md` | 0.18.1 | `manifest` |
+| `contracts/sidecar.md` | 0.36.3 | the component ↔ sidecar boundary `bbsdk` speaks |
+| `contracts/blackboard_platform.md` | 0.38.0 | `blackboard` |
+| `contracts/manifest.md` | 0.20.0 | `manifest` |
 
 The `// Contract:` annotations throughout the source resolve against that upstream `contracts/`
 directory.

@@ -511,7 +511,12 @@ func (v *validator) precondition(data map[string]any, reads []string) {
 	}
 }
 
+// coveredByAny judges a precondition reference watched: a literal key by match, a pattern reference
+// (one carrying "*" or ">") by intersection with a reads pattern (rule 10).
 func coveredByAny(key string, reads []string) bool {
+	if strings.ContainsAny(key, "*>") {
+		return intersectsAny(key, reads)
+	}
 	for _, read := range reads {
 		if patternCovers(read, key) {
 			return true

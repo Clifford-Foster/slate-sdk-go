@@ -26,6 +26,8 @@ type Record struct {
 	Snapshot map[string]map[string]any
 	// ChangedKeys is the sorted set of watched keys changed since the previous evaluation.
 	ChangedKeys []string
+	// Revisions is the delivery identity this activation carried: each changed key's board revision (rule B3).
+	Revisions map[string]uint64
 	// Writes are the writes that succeeded, in application order.
 	Writes []Write
 	// Publishes are the returned names routed to a declared publishes subject, never put on the
@@ -112,6 +114,7 @@ func (h *Harness) runActivation(
 		Source:       source,
 		Snapshot:     snapshot,
 		ChangedKeys:  changed,
+		Revisions:    deliveryIdentity(changed, revisions),
 		Consumed:     []string{},
 	}
 	h.mu.Unlock()
@@ -142,7 +145,7 @@ func (h *Harness) deliver(
 	ctx context.Context, record *Record, delivery *plane, input map[string]any, revisions map[string]uint64,
 ) {
 	activation := bbsdk.HarnessActivation(delivery, blackboardID, record.ActivationID,
-		record.Source, input, record.Snapshot, record.ChangedKeys, h.config)
+		record.Source, input, record.Snapshot, record.ChangedKeys, record.Revisions, h.config)
 	writes, err := h.component(ctx, activation)
 	if err != nil {
 		// A component failure is recorded, never propagated: earlier successful writes stand (rule H9).
@@ -228,6 +231,19 @@ func (h *Harness) applyReturned(ctx context.Context, delivery *plane, writes bbs
 // matching it as a key, and the publishes entry's own schema where it names one (rules H20, H21).
 func (h *Harness) outboundVerdicts(name string, value map[string]any) []bbsdk.ValidationVerdict {
 	return append(h.shapes.writeVerdicts(name, value), h.shapes.publishVerdicts(name, value)...)
+}
+
+// deliveryIdentity is what the sidecar's ActivationPayload.revisions carries: the snapshot revision
+// of every changed key still present, a deleted key omitted, and the empty map — never nil — on a
+// subject activation, whose identity is the message's own (sidecar.md rule B3).
+func deliveryIdentity(changed []string, revisions map[string]uint64) map[string]uint64 {
+	identity := make(map[string]uint64, len(changed))
+	for _, key := range changed {
+		if revision, known := revisions[key]; known {
+			identity[key] = revision
+		}
+	}
+	return identity
 }
 
 // consume CAS-deletes the triggering keys a consumes pattern matches, at their snapshot revisions: a

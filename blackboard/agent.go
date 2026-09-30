@@ -165,9 +165,15 @@ func (a *Agent) Start(ctx context.Context, board *Blackboard, opts StartOptions)
 		}
 	}
 
+	// An agent with no watched keys has no replay to wait on and no change to evaluate, so its
+	// loop parks on a channel nothing closes until Stop cancels it (§3.4 rule 3).
+	synced := make(chan struct{})
 	var handle *WatchHandle
 	if len(a.spec.Reads) > 0 {
-		handle, err = board.Watch(runCtx, a.spec.Reads, a.onChange, WatchOptions{OnDelete: a.onDelete})
+		handle, err = board.Watch(runCtx, a.spec.Reads, a.onChange, WatchOptions{
+			OnSynced: func() { close(synced) },
+			OnDelete: a.onDelete,
+		})
 		if err != nil {
 			a.release(cancel)
 			return err
@@ -195,7 +201,7 @@ func (a *Agent) Start(ctx context.Context, board *Blackboard, opts StartOptions)
 	a.mu.Unlock()
 	go func() {
 		defer close(done)
-		a.run(runCtx)
+		a.run(runCtx, synced)
 	}()
 	return nil
 }
@@ -304,6 +310,13 @@ func (a *Agent) notify() {
 	}
 }
 
+// markChanged records a pending change with no key behind it: the completed replay's own trigger.
+func (a *Agent) markChanged() {
+	a.mu.Lock()
+	a.changed = true
+	a.mu.Unlock()
+}
+
 // takeChange consumes the pending-change flag, reporting whether one was recorded.
 func (a *Agent) takeChange() bool {
 	a.mu.Lock()
@@ -313,8 +326,17 @@ func (a *Agent) takeChange() bool {
 	return changed
 }
 
-// run evaluates the precondition once per debounced burst, one activation at a time (§3.4 rules 1, 2).
-func (a *Agent) run(ctx context.Context) {
+// run holds the first evaluation until the watch's initial replay is complete, then evaluates the
+// precondition once per debounced burst, one activation at a time (§3.4 rules 1, 2, 3).
+func (a *Agent) run(ctx context.Context, synced <-chan struct{}) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-synced:
+	}
+	// The completed replay is itself the first evaluation's trigger, so an agent whose watched keys
+	// hold nothing at start still evaluates exactly once against the empty snapshot (§3.4 rule 3).
+	a.markChanged()
 	for {
 		if !a.awaitChange(ctx) {
 			return

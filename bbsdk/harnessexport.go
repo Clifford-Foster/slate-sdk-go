@@ -22,6 +22,7 @@ func HarnessActivation(
 	input map[string]any,
 	snapshot map[string]map[string]any,
 	changedKeys []string,
+	revisions map[string]uint64,
 	config map[string]any,
 ) *Activation {
 	return newActivation(activationPayload{
@@ -32,6 +33,9 @@ func HarnessActivation(
 		Input:       input,
 		Snapshot:    snapshot,
 		ChangedKeys: changedKeys,
+		// The delivery identity the harness's own board assigned, so a component's dedup runs here
+		// exactly as it runs behind the sidecar (rule B3; test_harness.md 0.22.0's parity).
+		Revisions: revisions,
 	}, plane, config)
 }
 

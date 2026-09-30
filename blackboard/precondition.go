@@ -74,7 +74,7 @@ func (p *Precondition) Evaluate(state EvalState) bool {
 	return p.root.eval(state.context())
 }
 
-// ReferencedKeys returns every KV key the expression references, deduplicated and sorted (§4 rule 8).
+// ReferencedKeys returns every KV key and key pattern the expression references, deduplicated and sorted (§4 rules 8, 11).
 func (p *Precondition) ReferencedKeys() []string {
 	acc := make(map[string]struct{})
 	p.root.collectKeys(acc)

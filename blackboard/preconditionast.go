@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -218,6 +219,150 @@ func (n changedNode) reason(ctx evalContext, result bool) string {
 		return "changed (" + shortValue(prior, priorPresent) + " → " + shortValue(current, currentPresent) + ")"
 	}
 	return "unchanged (" + shortValue(current, currentPresent) + ")"
+}
+
+// keyPattern is a pattern atom's operand, a key family in the read-pattern grammar (§4 rule 10).
+type keyPattern string
+
+// matches reports whether a key is in the family: "*" exactly one token, a final ">" one or more (§1 watch).
+func (k keyPattern) matches(key string) bool {
+	keyTokens := strings.Split(key, ".")
+	patternTokens := strings.Split(string(k), ".")
+	for i, part := range patternTokens {
+		if part == ">" {
+			return i < len(keyTokens)
+		}
+		if i >= len(keyTokens) {
+			return false
+		}
+		if part != "*" && part != keyTokens[i] {
+			return false
+		}
+	}
+	return len(keyTokens) == len(patternTokens)
+}
+
+// matching returns the snapshot's keys the pattern matches, sorted.
+func (k keyPattern) matching(snapshot map[string]any) []string {
+	keys := []string{}
+	for key := range snapshot {
+		if k.matches(key) {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// setMatches returns the matching keys whose value is set — present and non-None (§4 rule 2).
+func (k keyPattern) setMatches(snapshot map[string]any) []string {
+	keys := []string{}
+	for _, key := range k.matching(snapshot) {
+		if snapshot[key] != nil {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+// changedMatches returns the matching keys added, deleted or rewritten between the previous snapshot and this one.
+func (k keyPattern) changedMatches(ctx evalContext) []string {
+	keys := []string{}
+	for _, key := range k.matching(ctx.snapshot) {
+		prior, priorPresent := ctx.previous[key]
+		if !priorPresent || !reflect.DeepEqual(ctx.snapshot[key], prior) {
+			keys = append(keys, key)
+		}
+	}
+	for _, key := range k.matching(ctx.previous) {
+		if _, present := ctx.snapshot[key]; !present {
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// setReason names a pattern's set matching keys, or the unset ones when none is set (§4 rule 12).
+func (k keyPattern) setReason(ctx evalContext) string {
+	if set := k.setMatches(ctx.snapshot); len(set) > 0 {
+		return namedKeys(set, "set")
+	}
+	if matching := k.matching(ctx.snapshot); len(matching) > 0 {
+		return namedKeys(matching, "null")
+	}
+	return "no matching key"
+}
+
+type patternIsSetNode struct {
+	pattern keyPattern
+}
+
+func (n patternIsSetNode) eval(ctx evalContext) bool {
+	return len(n.pattern.setMatches(ctx.snapshot)) > 0
+}
+
+func (n patternIsSetNode) collectKeys(acc map[string]struct{}) { acc[string(n.pattern)] = struct{}{} }
+
+func (n patternIsSetNode) unparse(int) string { return string(n.pattern) + " IS SET" }
+
+func (n patternIsSetNode) reason(ctx evalContext, _ bool) string { return n.pattern.setReason(ctx) }
+
+type patternIsNotSetNode struct {
+	pattern keyPattern
+}
+
+func (n patternIsNotSetNode) eval(ctx evalContext) bool {
+	return len(n.pattern.setMatches(ctx.snapshot)) == 0
+}
+
+func (n patternIsNotSetNode) collectKeys(acc map[string]struct{}) {
+	acc[string(n.pattern)] = struct{}{}
+}
+
+func (n patternIsNotSetNode) unparse(int) string { return string(n.pattern) + " IS NOT SET" }
+
+func (n patternIsNotSetNode) reason(ctx evalContext, _ bool) string { return n.pattern.setReason(ctx) }
+
+type patternChangedNode struct {
+	pattern keyPattern
+}
+
+func (n patternChangedNode) eval(ctx evalContext) bool {
+	return ctx.hasPrevious && len(n.pattern.changedMatches(ctx)) > 0
+}
+
+func (n patternChangedNode) collectKeys(acc map[string]struct{}) { acc[string(n.pattern)] = struct{}{} }
+
+func (n patternChangedNode) unparse(int) string { return string(n.pattern) + " CHANGED" }
+
+func (n patternChangedNode) reason(ctx evalContext, _ bool) string {
+	if !ctx.hasPrevious {
+		return "no previous snapshot"
+	}
+	if changed := n.pattern.changedMatches(ctx); len(changed) > 0 {
+		return namedKeys(changed, "changed")
+	}
+	if matching := n.pattern.matching(ctx.snapshot); len(matching) > 0 {
+		return namedKeys(matching, "unchanged")
+	}
+	return "no matching key, unchanged"
+}
+
+// patternDetailKeys is how many matching keys a pattern atom's detail names before eliding the rest (§4 rule 12).
+const patternDetailKeys = 3
+
+// namedKeys renders a count of matching keys, their state, and the first few of them, e.g. "2 matching keys set (a, b)".
+func namedKeys(keys []string, state string) string {
+	noun := "matching keys"
+	if len(keys) == 1 {
+		noun = "matching key"
+	}
+	named := strings.Join(keys[:min(len(keys), patternDetailKeys)], ", ")
+	if len(keys) > patternDetailKeys {
+		named += ", …"
+	}
+	return fmt.Sprintf("%d %s %s (%s)", len(keys), noun, state, named)
 }
 
 type olderThanNode struct {

@@ -15,6 +15,7 @@ type tokenKind int
 const (
 	tokenEOF tokenKind = iota
 	tokenKey
+	tokenPattern
 	tokenString
 	tokenDuration
 	tokenEq
@@ -38,6 +39,8 @@ func (k tokenKind) String() string {
 		return "EOF"
 	case tokenKey:
 		return "KEY"
+	case tokenPattern:
+		return "PATTERN"
 	case tokenString:
 		return "STRING"
 	case tokenDuration:
@@ -133,7 +136,14 @@ func tokenize(expression string) ([]token, error) {
 			}
 			word := expression[i:end]
 			kind, isKeyword := keywords[word]
-			if !isKeyword {
+			switch {
+			case isKeyword:
+			case strings.ContainsAny(word, "*>"):
+				if !validKeyPattern(word) {
+					return nil, fmt.Errorf("%w: invalid key pattern %q at position %d", ErrPreconditionParse, word, i)
+				}
+				kind = tokenPattern
+			default:
 				kind = tokenKey
 			}
 			tokens = append(tokens, token{kind: kind, text: word, pos: i})
@@ -167,13 +177,31 @@ func scanDuration(expression string, start int) (token, int, error) {
 	return token{kind: tokenDuration, text: expression[start:end], pos: start}, end, nil
 }
 
-// wordEnd returns the end of the [a-zA-Z0-9._]+ run starting at i, or i when there is none.
+// wordEnd returns the end of the [a-zA-Z0-9._*>]+ run starting at i, or i when there is none; the
+// wildcard bytes make the run a key pattern (§4 rule 10).
 func wordEnd(expression string, i int) int {
 	end := i
-	for end < len(expression) && isWordByte(expression[end]) {
+	for end < len(expression) && (isWordByte(expression[end]) || expression[end] == '*' || expression[end] == '>') {
 		end++
 	}
 	return end
+}
+
+// validKeyPattern reports whether a word is a read pattern: tokens of [a-zA-Z0-9_]+ or "*", and ">" last only (§4 rule 10).
+func validKeyPattern(word string) bool {
+	tokens := strings.Split(word, ".")
+	for i, part := range tokens {
+		switch {
+		case part == "*":
+		case part == ">":
+			if i != len(tokens)-1 {
+				return false
+			}
+		case part == "" || strings.ContainsAny(part, "*>"):
+			return false
+		}
+	}
+	return true
 }
 
 // isDigit reports whether a byte is an ASCII digit.
@@ -308,6 +336,10 @@ func (p *parser) parseAtom() (node, error) {
 		}
 		return group, nil
 	}
+	if current.kind == tokenPattern {
+		p.advance()
+		return p.parsePatternOperator(keyPattern(current.text))
+	}
 	if current.kind != tokenKey {
 		return nil, fmt.Errorf("%w: expected key or '(' but got %q at position %d",
 			ErrPreconditionParse, current.text, current.pos)
@@ -358,21 +390,62 @@ func (p *parser) parseOperator(reference ref) (node, error) {
 	}
 }
 
+// parsePatternOperator reads the operator after a key pattern: IS SET, IS NOT SET or CHANGED only (§4 rule 10).
+func (p *parser) parsePatternOperator(pattern keyPattern) (node, error) {
+	operator := p.current()
+	switch operator.kind {
+	case tokenIs:
+		p.advance()
+		negated, err := p.parseIsTail()
+		if err != nil {
+			return nil, err
+		}
+		if negated {
+			return patternIsNotSetNode{pattern: pattern}, nil
+		}
+		return patternIsSetNode{pattern: pattern}, nil
+	case tokenChanged:
+		p.advance()
+		return patternChangedNode{pattern: pattern}, nil
+	case tokenColon:
+		return nil, fmt.Errorf("%w: a key pattern takes no field accessor at position %d",
+			ErrPreconditionParse, operator.pos)
+	case tokenEq, tokenNeq, tokenOlderThan:
+		return nil, fmt.Errorf("%w: %s does not accept a key pattern at position %d",
+			ErrPreconditionParse, operator.kind, operator.pos)
+	default:
+		return nil, fmt.Errorf("%w: expected IS or CHANGED after key pattern but got %q at position %d",
+			ErrPreconditionParse, operator.text, operator.pos)
+	}
+}
+
 // parseIs reads the SET or NOT SET tail of an IS operator.
 func (p *parser) parseIs(reference ref) (node, error) {
+	negated, err := p.parseIsTail()
+	if err != nil {
+		return nil, err
+	}
+	if negated {
+		return isNotSetNode{ref: reference}, nil
+	}
+	return isSetNode{ref: reference}, nil
+}
+
+// parseIsTail reads SET or NOT SET after IS, reporting whether it was NOT SET.
+func (p *parser) parseIsTail() (bool, error) {
 	next := p.current()
 	switch next.kind {
 	case tokenSet:
 		p.advance()
-		return isSetNode{ref: reference}, nil
+		return false, nil
 	case tokenNot:
 		p.advance()
 		if _, err := p.expect(tokenSet); err != nil {
-			return nil, err
+			return false, err
 		}
-		return isNotSetNode{ref: reference}, nil
+		return true, nil
 	default:
-		return nil, fmt.Errorf("%w: expected SET or NOT after IS but got %q at position %d",
+		return false, fmt.Errorf("%w: expected SET or NOT after IS but got %q at position %d",
 			ErrPreconditionParse, next.text, next.pos)
 	}
 }
